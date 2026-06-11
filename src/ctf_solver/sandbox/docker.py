@@ -14,7 +14,7 @@ from typing import Any
 
 import aiodocker
 
-from ctf_solver.sandbox import ExecResult, SandboxProtocol
+from ctf_solver.sandbox import ExecResult
 
 logger = logging.getLogger(__name__)
 
