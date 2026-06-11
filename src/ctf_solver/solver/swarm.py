@@ -27,6 +27,8 @@ from ctf_solver.tools.core import (
     do_read_file,
     do_submit_flag,
     do_web_fetch,
+    do_webhook_create,
+    do_webhook_get_requests,
     do_write_file,
 )
 from ctf_solver.tools.flag import extract_flags
@@ -197,7 +199,7 @@ class ChallengeSwarm:
             inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
 
             message = ""
-            submitted_flags: set[str] = set()
+            pending_tool_results: list[ToolResult] | None = None
 
             while not self.cancel_event.is_set():
                 if inst.step_count >= self.settings.max_steps:
@@ -227,7 +229,7 @@ class ChallengeSwarm:
                         await inst.session.inject_context(insights_text)
 
                 try:
-                    response = await inst.session.send(message)
+                    response = await inst.session.send(message, tool_results=pending_tool_results)
                 except Exception as e:
                     if cb:
                         cb.record_failure()
@@ -277,7 +279,7 @@ class ChallengeSwarm:
                     inst.step_count += 1
                     if inst.tracer:
                         inst.tracer.tool_call(tc.name, tc.arguments, inst.step_count)
-                    result_str = await self._execute_tool(inst, tc, submitted_flags)
+                    result_str = await self._execute_tool(inst, tc)
                     if inst.tracer:
                         inst.tracer.tool_result(tc.name, result_str, inst.step_count)
                     tool_results.append(ToolResult(content=result_str))
@@ -298,6 +300,7 @@ class ChallengeSwarm:
                         )
 
                 message = ""
+                pending_tool_results = tool_results if tool_results else None
 
             if inst.confirmed and inst.flag:
                 return SolverResult(
@@ -355,12 +358,12 @@ class ChallengeSwarm:
                 inst.tracer.close()
             self.event_bus.publish(SolverEvent(type="solver_done", solver_id=inst.solver_id, data={}))
 
-    async def _execute_tool(self, inst: SolverInstance, tc: ToolCall, submitted_flags: set[str]) -> str:
+    async def _execute_tool(self, inst: SolverInstance, tc: ToolCall) -> str:
         name = tc.name
         args = tc.arguments
 
         if name == "bash":
-            return await do_bash(inst.sandbox, args.get("command", ""), args.get("timeout", 60))
+            return await do_bash(inst.sandbox, args.get("command", ""), int(args.get("timeout", 60)))
         elif name == "read_file":
             return await do_read_file(inst.sandbox, args.get("path", ""))
         elif name == "write_file":
@@ -369,12 +372,16 @@ class ChallengeSwarm:
             return await do_list_files(inst.sandbox, args.get("path", "/challenge/distfiles"))
         elif name == "web_fetch":
             return await do_web_fetch(args.get("url", ""), args.get("method", "GET"), args.get("body", ""))
+        elif name == "webhook_create":
+            return await do_webhook_create()
+        elif name == "webhook_get_requests":
+            return await do_webhook_get_requests(args.get("uuid", ""))
         elif name == "submit_flag":
             flag = args.get("flag", "")
             cooled, msg_text = self._check_cooldown(inst)
             if not cooled:
                 return msg_text
-            result, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, submitted_flags)
+            result, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, self._submitted_flags)
             if is_valid:
                 inst.flag = flag
                 inst.confirmed = True
