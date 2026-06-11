@@ -28,6 +28,9 @@ class CTFApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("l", "toggle_logs", "Logs"),
+        ("s", "toggle_status", "Status"),
+        ("h", "focus_hint", "Hint"),
+        ("c", "toggle_cost", "Cost"),
     ]
 
     def __init__(self, event_bus: EventBus, challenge_name: str = "Unknown", **kwargs) -> None:
@@ -66,5 +69,31 @@ class CTFApp(App):
         msg_log = self.query_one(MessageLog)
         msg_log.log_message(f"[{event.solver_id}] {event.type}: {str(event.data)[:100]}")
 
+        if event.type == "cost_update":
+            cost_bar = self.query_one(CostBar)
+            cost_bar.update_cost(event.data.get("cost", 0.0), 10.0)
+
+        if event.type == "solver_started":
+            panel = self.query_one(SolverPanel)
+            panel.add_solver(event.solver_id, event.data)
+
+        if event.type == "solver_done":
+            panel = self.query_one(SolverPanel)
+            panel.mark_done(event.solver_id)
+
+    def on_hint_input_bar_hint_submitted(self, event: HintInputBar.HintSubmitted) -> None:
+        self.event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": event.text}))
+        msg_log = self.query_one(MessageLog)
+        msg_log.log_message(f"[operator] hint: {event.text}")
+
     def action_toggle_logs(self) -> None:
+        pass
+
+    def action_toggle_status(self) -> None:
+        pass
+
+    def action_focus_hint(self) -> None:
+        self.query_one(HintInputBar).focus()
+
+    def action_toggle_cost(self) -> None:
         pass

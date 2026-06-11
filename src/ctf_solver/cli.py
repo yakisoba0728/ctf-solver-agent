@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import shutil
+import signal
 import sys
+import tempfile
+from pathlib import Path
 
 import click
 from rich.console import Console
 
 from ctf_solver.config import Settings, get_coordinator_provider, validate_provider_config
+from ctf_solver.events import EventBus
+from ctf_solver.solver.swarm import ChallengeSwarm
 
 console = Console()
 
@@ -138,8 +145,104 @@ def main(
         if not confirmed:
             return
 
-    console.print("\n[yellow]Solver execution not yet available (provider stubs).[/yellow]")
-    console.print("Implement providers to enable full execution.")
+    if challenge_dir:
+        chall_dir = challenge_dir
+    else:
+        chall_dir = tempfile.mkdtemp(prefix="ctf-chall-")
+        for f in files:
+            shutil.copy2(f, chall_dir)
+        (Path(chall_dir) / "description.txt").write_text(desc or "")
+
+    event_bus = EventBus()
+    swarm = ChallengeSwarm(
+        challenge_dir=chall_dir,
+        challenge_name=Path(chall_dir).name,
+        description=desc or "",
+        category=category,
+        settings=settings,
+        event_bus=event_bus,
+    )
+
+    swarm_ref = [swarm]
+
+    def handle_sigint(signum: int, frame: object) -> None:
+        console.print("\n[yellow]SIGINT received, shutting down gracefully...[/yellow]")
+        swarm_ref[0].kill()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    if no_tui:
+        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive))
+        from ctf_solver.writeup import generate_writeup
+
+        if result and result.flag:
+            console.print(f"\n[bold green]FLAG FOUND: {result.flag}[/bold green]")
+            console.print(f"  Solver: {result.solver_id}")
+            console.print(f"  Steps: {result.steps}, Duration: {result.duration:.1f}s, Cost: ${result.cost_usd:.4f}")
+        else:
+            console.print("\n[red]No flag found.[/red]")
+        if result:
+            generate_writeup(output_dir or chall_dir, Path(chall_dir).name, category, result)
+    else:
+        from ctf_solver.tui.app import CTFApp
+
+        app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name)
+
+        async def run_with_tui() -> object:
+            swarm_task = asyncio.create_task(swarm.run())
+            await app.run_async()
+            swarm.kill()
+            return await swarm_task
+
+        result = asyncio.run(run_with_tui())
+        if result and result.flag:
+            console.print(f"\n[bold green]FLAG: {result.flag}[/bold green]")
+
+
+async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Settings, interactive: bool) -> object:
+    from ctf_solver.events import SolverEvent
+
+    queue = event_bus.subscribe()
+
+    async def print_events() -> None:
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                if event.type == "solver_started":
+                    console.print(f"[green]\u25b6 {event.solver_id} started[/green]")
+                elif event.type == "solver_done":
+                    console.print(f"[blue]\u25cb {event.solver_id} done[/blue]")
+                elif event.type == "flag_found":
+                    console.print(f"[bold yellow]\u2691 {event.solver_id}: {event.data}[/bold yellow]")
+                elif event.type == "cost_update":
+                    pass
+                else:
+                    console.print(f"  [{event.solver_id}] {event.type}")
+            except TimeoutError:
+                continue
+
+    events_task = asyncio.create_task(print_events())
+
+    stdin_task: asyncio.Task | None = None
+    if interactive:
+        loop = asyncio.get_event_loop()
+
+        async def read_stdin() -> None:
+            while True:
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+                if not line:
+                    break
+                hint_text = line.strip()
+                if hint_text:
+                    event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": hint_text}))
+
+        stdin_task = asyncio.create_task(read_stdin())
+
+    result = await swarm.run()
+    events_task.cancel()
+    if stdin_task:
+        stdin_task.cancel()
+    return result
 
 
 @click.command()
