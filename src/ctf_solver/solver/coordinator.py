@@ -82,7 +82,7 @@ class CoordinatorAgent:
                         provider_spec=self.provider_name,
                     )
                 except NotImplementedError:
-                    break
+                    continue
                 except Exception as e:
                     logger.warning("Coordinator error: %s", e)
 

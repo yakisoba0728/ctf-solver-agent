@@ -186,7 +186,7 @@ def main(
     else:
         from ctf_solver.tui.app import CTFApp
 
-        app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name)
+        app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name, max_cost=max_cost)
 
         async def run_with_tui() -> object:
             from ctf_solver.hint_server import start_hint_server
@@ -197,6 +197,7 @@ def main(
             await app.run_async()
             swarm.kill()
             hint_server.close()
+            await hint_server.wait_closed()
             return await swarm_task
 
         result = asyncio.run(run_with_tui())
@@ -234,7 +235,7 @@ async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Setting
 
     stdin_task: asyncio.Task | None = None
     if interactive:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         async def read_stdin() -> None:
             while True:
@@ -252,6 +253,7 @@ async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Setting
     if stdin_task:
         stdin_task.cancel()
     hint_server.close()
+    await hint_server.wait_closed()
     return result
 
 

@@ -33,10 +33,11 @@ class CTFApp(App):
         ("c", "toggle_cost", "Cost"),
     ]
 
-    def __init__(self, event_bus: EventBus, challenge_name: str = "Unknown", **kwargs) -> None:
+    def __init__(self, event_bus: EventBus, challenge_name: str = "Unknown", max_cost: float = 10.0, **kwargs) -> None:
         super().__init__(**kwargs)
         self.event_bus = event_bus
         self.challenge_name = challenge_name
+        self.max_cost = max_cost
         self._event_queue = event_bus.subscribe()
         self._update_task: asyncio.Task | None = None
 
@@ -66,20 +67,23 @@ class CTFApp(App):
                 break
 
     def _handle_event(self, event: SolverEvent) -> None:
-        msg_log = self.query_one(MessageLog)
-        msg_log.log_message(f"[{event.solver_id}] {event.type}: {str(event.data)[:100]}")
+        try:
+            msg_log = self.query_one(MessageLog)
+            msg_log.log_message(f"[{event.solver_id}] {event.type}: {str(event.data)[:100]}")
 
-        if event.type == "cost_update":
-            cost_bar = self.query_one(CostBar)
-            cost_bar.update_cost(event.data.get("cost", 0.0), 10.0)
+            if event.type == "cost_update":
+                cost_bar = self.query_one(CostBar)
+                cost_bar.update_cost(event.data.get("cost", 0.0), self.max_cost)
 
-        if event.type == "solver_started":
-            panel = self.query_one(SolverPanel)
-            panel.add_solver(event.solver_id, event.data)
+            if event.type == "solver_started":
+                panel = self.query_one(SolverPanel)
+                panel.add_solver(event.solver_id, event.data)
 
-        if event.type == "solver_done":
-            panel = self.query_one(SolverPanel)
-            panel.mark_done(event.solver_id)
+            if event.type == "solver_done":
+                panel = self.query_one(SolverPanel)
+                panel.mark_done(event.solver_id)
+        except Exception:
+            pass
 
     def on_hint_input_bar_hint_submitted(self, event: HintInputBar.HintSubmitted) -> None:
         self.event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": event.text}))
