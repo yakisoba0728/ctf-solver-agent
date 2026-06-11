@@ -38,6 +38,8 @@ from ctf_solver.tracking.cost_tracker import CostTracker
 
 logger = logging.getLogger(__name__)
 
+MAX_CONSECUTIVE_ERRORS = 3
+
 SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]
 
 
@@ -275,6 +277,7 @@ class ChallengeSwarm:
                     break
 
                 tool_results: list[ToolResult] = []
+                consecutive_errors = 0
                 for tc in response.tool_calls:
                     inst.step_count += 1
                     if inst.tracer:
@@ -283,6 +286,18 @@ class ChallengeSwarm:
                     if inst.tracer:
                         inst.tracer.tool_result(tc.name, result_str, inst.step_count)
                     tool_results.append(ToolResult(content=result_str))
+
+                    if "Error" in result_str or "error" in result_str.lower():
+                        consecutive_errors += 1
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            logger.warning(
+                                "[%s] %d consecutive tool errors, stopping",
+                                inst.solver_id,
+                                MAX_CONSECUTIVE_ERRORS,
+                            )
+                            break
+                    else:
+                        consecutive_errors = 0
 
                     loop_status = inst.loop_detector.check(tc.name, tc.arguments)
                     if loop_status == "warn":
@@ -303,7 +318,7 @@ class ChallengeSwarm:
                 pending_tool_results = tool_results if tool_results else None
 
             if inst.confirmed and inst.flag:
-                return SolverResult(
+                result = SolverResult(
                     solver_id=inst.solver_id,
                     status=ResultStatus.SOLVED,
                     flag=inst.flag,
@@ -313,8 +328,9 @@ class ChallengeSwarm:
                     trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
                     findings_summary=inst.findings,
                 )
+                return result
 
-            return SolverResult(
+            result = SolverResult(
                 solver_id=inst.solver_id,
                 status=ResultStatus.FAILED,
                 flag=inst.flag,
@@ -324,6 +340,11 @@ class ChallengeSwarm:
                 trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
                 findings_summary=inst.findings,
             )
+
+            if inst.step_count == 0 and inst.cost_usd == 0.0:
+                logger.warning("[%s] Broken solver — 0 steps, $0 cost", inst.solver_id)
+
+            return result
         except NotImplementedError as e:
             logger.warning("[%s] Provider stub: %s", inst.solver_id, e)
             return SolverResult(
