@@ -1,0 +1,11 @@
+CTF Solver Sandbox — Installed Tools
+=====================================
+
+Binary Analysis:  radare2, GDB, objdump, binwalk, strings, readelf, file, xxd
+Pwn:              pwntools, ROPgadget, angr, unicorn, capstone
+Crypto:           RsaCtfTool, z3, gmpy2, pycryptodome, sympy
+Forensics:        volatility3, foremost, exiftool, testdisk
+Stego:            steghide, zsteg, ImageMagick, tesseract OCR
+Web:              curl, nmap, Python requests, flask
+Misc:             ffmpeg, sox, Pillow, numpy, scipy
+Languages:        Python3, Ruby, GCC, G++, Make, CMake
