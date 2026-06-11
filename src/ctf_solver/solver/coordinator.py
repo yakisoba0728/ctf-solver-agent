@@ -32,6 +32,8 @@ class CoordinatorAgent:
     swarm: ChallengeSwarm | None = None
     session: SolverSession | None = None
     _task: asyncio.Task | None = None
+    _hint_queue: asyncio.Queue | None = None
+    _hint_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         provider = get_provider(self.provider_name)
@@ -46,16 +48,17 @@ class CoordinatorAgent:
             config=config,
         )
         self._task = asyncio.create_task(self._coordination_loop())
+        self._hint_queue = self.event_bus.subscribe()
+        self._hint_task = asyncio.create_task(self._relay_hints())
         logger.info("Coordinator started with %s", self.provider_name)
 
     async def _coordination_loop(self) -> None:
-        """Periodically read solver traces and inject guidance."""
         while True:
             await asyncio.sleep(30)
-            if not self.swarm:
+            if not self.swarm or not self.session:
                 continue
             status = self.swarm.get_status()
-            for solver_id, _ in status.get("solvers", {}).items():
+            for solver_id, info in status.get("solvers", {}).items():
                 solver = self.swarm.solvers.get(solver_id)
                 if not solver or not solver.tracer:
                     continue
@@ -66,9 +69,35 @@ class CoordinatorAgent:
                     lines = trace_path.read_text().strip().split("\n")
                     recent = lines[-10:]
                     summary = self._summarize_trace(recent)
-                    await self.message_bus.broadcast("coordinator", f"Guidance for {solver_id}: {summary[:500]}")
+                    guidance_prompt = f"Solver {solver_id} (steps: {info.get('steps', 0)}) recent activity:\n{summary}\n\nProvide brief strategic guidance."
+                    response = await self.session.send(guidance_prompt)
+                    if response.text:
+                        await self.message_bus.broadcast("coordinator", response.text[:500])
+                    self.cost_tracker.record_tokens(
+                        "coordinator",
+                        self.provider_name,
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        cache_read_tokens=response.usage.cache_read_tokens,
+                        provider_spec=self.provider_name,
+                    )
+                except NotImplementedError:
+                    break
                 except Exception as e:
-                    logger.warning("Coordinator trace read error: %s", e)
+                    logger.warning("Coordinator error: %s", e)
+
+    async def _relay_hints(self) -> None:
+        while True:
+            try:
+                event = await asyncio.wait_for(self._hint_queue.get(), timeout=1.0)
+                if event.type == "user_hint":
+                    hint = event.data.get("message", "")
+                    if hint:
+                        await self.message_bus.broadcast("operator", f"Operator hint: {hint}")
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
 
     def _summarize_trace(self, lines: list[str]) -> str:
         parts = []
@@ -87,6 +116,12 @@ class CoordinatorAgent:
         return "\n".join(parts) if parts else "No recent activity."
 
     async def stop(self) -> None:
+        if self._hint_task:
+            self._hint_task.cancel()
+            try:
+                await self._hint_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._task:
             self._task.cancel()
             try:
