@@ -172,7 +172,7 @@ def main(
     signal.signal(signal.SIGINT, handle_sigint)
 
     if no_tui:
-        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive))
+        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port))
         from ctf_solver.writeup import generate_writeup
 
         if result and result.flag:
@@ -189,9 +189,14 @@ def main(
         app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name)
 
         async def run_with_tui() -> object:
+            from ctf_solver.hint_server import start_hint_server
+
+            hint_server, hint_port = await start_hint_server(event_bus, port)
+            console.print(f"  Hint server: http://127.0.0.1:{hint_port}/hint")
             swarm_task = asyncio.create_task(swarm.run())
             await app.run_async()
             swarm.kill()
+            hint_server.close()
             return await swarm_task
 
         result = asyncio.run(run_with_tui())
@@ -199,8 +204,12 @@ def main(
             console.print(f"\n[bold green]FLAG: {result.flag}[/bold green]")
 
 
-async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Settings, interactive: bool) -> object:
+async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Settings, interactive: bool, port: int) -> object:
     from ctf_solver.events import SolverEvent
+    from ctf_solver.hint_server import start_hint_server
+
+    hint_server, hint_port = await start_hint_server(event_bus, port)
+    console.print(f"  Hint server: http://127.0.0.1:{hint_port}/hint")
 
     queue = event_bus.subscribe()
 
@@ -242,6 +251,7 @@ async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Setting
     events_task.cancel()
     if stdin_task:
         stdin_task.cancel()
+    hint_server.close()
     return result
 
 
