@@ -60,7 +60,7 @@ class CoordinatorAgent:
             if not self.swarm:
                 continue
             status = self.swarm.get_status()
-            for solver_id, info in status.get("solvers", {}).items():
+            for solver_id, _info in status.get("solvers", {}).items():
                 solver = self.swarm.solvers.get(solver_id)
                 if not solver or not solver.tracer:
                     continue
