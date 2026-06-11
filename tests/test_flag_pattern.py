@@ -1,6 +1,6 @@
 """Tests for flag pattern matching."""
 
-from ctf_solver.tools.flag import extract_flags, DEFAULT_FLAG_PATTERN
+from ctf_solver.tools.flag import DEFAULT_FLAG_PATTERN, extract_flags
 
 
 def test_extract_standard_flag():

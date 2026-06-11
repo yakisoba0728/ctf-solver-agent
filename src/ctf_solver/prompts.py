@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
 
 from ctf_solver.tools.vision import IMAGE_EXTS
 

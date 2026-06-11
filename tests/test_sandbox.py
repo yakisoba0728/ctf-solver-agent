@@ -3,6 +3,7 @@
 import subprocess
 
 import pytest
+
 from ctf_solver.sandbox.docker import DockerSandbox, ExecResult
 
 
