@@ -133,6 +133,11 @@ def main(
         console.print("\n[green]DRY RUN — configuration valid.[/green]")
         return
 
+    if no_docker:
+        confirmed = click.confirm("Running without Docker sandbox is dangerous. Continue?", default=False)
+        if not confirmed:
+            return
+
     console.print("\n[yellow]Solver execution not yet available (provider stubs).[/yellow]")
     console.print("Implement providers to enable full execution.")
 
