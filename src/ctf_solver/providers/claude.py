@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from ctf_solver.providers.base import ProviderProtocol
+from ctf_solver.providers.base import ProviderBase, SolverSession
 
 
-class ClaudeProvider(ProviderProtocol):
+class ClaudeProvider(ProviderBase):
     name = "claude"
 
     def validate_config(self, config: dict) -> bool:
@@ -19,7 +19,7 @@ class ClaudeProvider(ProviderProtocol):
             has_sdk = False
         return has_key and has_sdk
 
-    async def create_session(self, solver_id: str, system_prompt: str, tools: list, config: dict):
+    async def create_session(self, solver_id: str, system_prompt: str, tools: list, config: dict) -> SolverSession:
         msg = (
             "Claude provider not yet integrated. "
             "Requires: ANTHROPIC_API_KEY env var + claude-agent-sdk package. "

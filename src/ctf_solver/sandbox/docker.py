@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 CONTAINER_LABEL = "ctf-agent"
 MAX_CONCURRENT_CONTAINERS = 20
+DEFAULT_MEMORY = 4 * 1024 * 1024 * 1024
 _container_sem: asyncio.Semaphore | None = None
 
 
@@ -51,7 +52,6 @@ class DockerSandbox:
 
     def _parse_memory_limit(self, s: str | None = None) -> int:
         s = (s or self.memory_limit).strip().lower()
-        default = 4 * 1024 * 1024 * 1024
         try:
             if s.endswith("g"):
                 result = int(float(s[:-1]) * 1024 * 1024 * 1024)
@@ -60,11 +60,11 @@ class DockerSandbox:
             else:
                 result = int(s)
             if result <= 0:
-                return default
+                return DEFAULT_MEMORY
             return result
         except (ValueError, IndexError):
             logger.warning("Invalid memory_limit %r, defaulting to 4GB", s)
-            return default
+            return DEFAULT_MEMORY
 
     async def start(self) -> None:
         sem = get_container_semaphore()

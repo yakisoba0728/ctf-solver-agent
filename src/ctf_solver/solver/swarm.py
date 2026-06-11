@@ -43,6 +43,17 @@ MAX_CONSECUTIVE_ERRORS = 3
 SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]
 
 
+async def retry_with_backoff(fn, max_retries: int = 3, base_delay: float = 1.0):
+    for attempt in range(max_retries):
+        try:
+            return await fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2**attempt)
+            await asyncio.sleep(delay)
+
+
 @dataclass
 class SolverInstance:
     solver_id: str
@@ -134,6 +145,7 @@ class ChallengeSwarm:
                     try:
                         result = task.result()
                     except Exception:
+                        logger.warning("Solver task failed", exc_info=True)
                         continue
                     if result and result.status == ResultStatus.SOLVED:
                         self.cancel_event.set()
@@ -153,186 +165,181 @@ class ChallengeSwarm:
             await asyncio.gather(*tasks, return_exceptions=True)
             return None
 
-    async def _run_solver(self, inst: SolverInstance) -> SolverResult | None:
-        t0 = time.monotonic()
+    async def _init_solver(self, inst: SolverInstance, t0: float) -> SolverResult | None:
         try:
-            try:
-                docker = aiodocker.Docker()
-                await docker.version()
-                await docker.close()
-            except Exception:
-                return SolverResult(
-                    solver_id=inst.solver_id,
-                    status=ResultStatus.ERROR,
-                    flag=None,
-                    steps=0,
-                    duration=time.monotonic() - t0,
-                    error="Docker is not running. Start Docker and try again.",
-                )
-
-            await inst.sandbox.start()
-            self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
-
-            provider = get_provider(inst.provider_name)
-            config = self.settings.to_provider_config()
-
-            if not provider.validate_config(config):
-                return SolverResult(
-                    solver_id=inst.solver_id,
-                    status=ResultStatus.ERROR,
-                    flag=None,
-                    steps=0,
-                    duration=time.monotonic() - t0,
-                    error=f"Provider {inst.provider_name} not configured",
-                )
-
-            log_dir = self.settings.log_dir or "logs"
-            inst.tracer = SolverTracer(self.challenge_name, inst.provider_name, log_dir=log_dir)
-
-            meta = ChallengeMeta(
-                name=self.challenge_name,
-                category=self.category,
-                description=self.description,
+            docker = aiodocker.Docker()
+            await docker.version()
+            await docker.close()
+        except Exception:
+            return SolverResult(
+                solver_id=inst.solver_id,
+                status=ResultStatus.ERROR,
+                flag=None,
+                steps=0,
+                duration=time.monotonic() - t0,
+                error="Docker is not running. Start Docker and try again.",
             )
-            distfiles = list_distfiles(self.challenge_dir)
-            container_arch = "linux/amd64"
-            system_prompt = build_prompt(meta, distfiles, container_arch, hint=self.settings.hint)
-            tools: list = []
-            inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
 
-            message = ""
-            pending_tool_results: list[ToolResult] | None = None
+        await inst.sandbox.start()
+        self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
 
-            while not self.cancel_event.is_set():
-                if inst.step_count >= self.settings.max_steps:
-                    break
-                elapsed = time.monotonic() - t0
-                if elapsed >= self.settings.timeout:
-                    return SolverResult(
-                        solver_id=inst.solver_id,
-                        status=ResultStatus.TIMEOUT,
-                        flag=inst.flag,
-                        steps=inst.step_count,
-                        duration=elapsed,
-                        cost_usd=inst.cost_usd,
-                        trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
-                        findings_summary=inst.findings,
-                    )
-                if self.cost_tracker.is_over_budget(self.settings.max_cost):
-                    break
+        provider = get_provider(inst.provider_name)
+        config = self.settings.to_provider_config()
 
-                cb = self._circuit_breakers.get(inst.provider_name)
-                if cb and not cb.is_available():
-                    break
+        if not provider.validate_config(config):
+            return SolverResult(
+                solver_id=inst.solver_id,
+                status=ResultStatus.ERROR,
+                flag=None,
+                steps=0,
+                duration=time.monotonic() - t0,
+                error=f"Provider {inst.provider_name} not configured",
+            )
 
-                if inst.step_count > 0 and inst.step_count % 5 == 0:
-                    insights_text = await do_check_findings(self.message_bus, inst.solver_id)
-                    if insights_text and "No new findings" not in insights_text:
-                        await inst.session.inject_context(insights_text)
+        log_dir = self.settings.log_dir or "logs"
+        inst.tracer = SolverTracer(self.challenge_name, inst.provider_name, log_dir=log_dir)
 
-                try:
-                    response = await inst.session.send(message, tool_results=pending_tool_results)
-                except Exception as e:
-                    if cb:
-                        cb.record_failure()
-                    logger.warning("[%s] LLM call failed: %s", inst.solver_id, e)
-                    break
+        meta = ChallengeMeta(
+            name=self.challenge_name,
+            category=self.category,
+            description=self.description,
+        )
+        distfiles = list_distfiles(self.challenge_dir)
+        container_arch = "linux/amd64"
+        system_prompt = build_prompt(meta, distfiles, container_arch, hint=self.settings.hint)
+        tools: list = []
+        inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
+        return None
 
-                if cb:
-                    cb.record_success()
+    async def _run_loop(self, inst: SolverInstance, t0: float) -> SolverResult:
+        message = ""
+        pending_tool_results: list[ToolResult] | None = None
 
-                self.cost_tracker.record_tokens(
-                    inst.solver_id, inst.model_spec,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    cache_read_tokens=response.usage.cache_read_tokens,
-                    provider_spec=inst.provider_name,
-                )
-                step_cost = self.cost_tracker.by_agent.get(inst.solver_id)
-                if step_cost:
-                    inst.cost_usd = step_cost.cost_usd
-                self.event_bus.publish(SolverEvent(type="cost_update", solver_id=inst.solver_id, data={"cost": inst.cost_usd}))
-
-                if inst.tracer:
-                    inst.tracer.usage(
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        response.usage.cache_read_tokens,
-                        inst.cost_usd,
-                    )
-
-                flags_found = extract_flags(response.text, self.settings.flag_pattern)
-                if flags_found:
-                    for flag in flags_found:
-                        msg_text, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, self._submitted_flags)
-                        if is_valid:
-                            inst.flag = flag
-                            inst.confirmed = True
-                            async with self._flag_lock:
-                                if not self.confirmed_flag:
-                                    self.confirmed_flag = flag
-                                    self.winner_id = inst.solver_id
-
-                if response.done or not response.tool_calls:
-                    break
-
-                tool_results: list[ToolResult] = []
-                consecutive_errors = 0
-                for tc in response.tool_calls:
-                    inst.step_count += 1
-                    if inst.tracer:
-                        inst.tracer.tool_call(tc.name, tc.arguments, inst.step_count)
-                    result_str = await self._execute_tool(inst, tc)
-                    if inst.tracer:
-                        inst.tracer.tool_result(tc.name, result_str, inst.step_count)
-                    tool_results.append(ToolResult(content=result_str))
-
-                    if "Error" in result_str or "error" in result_str.lower():
-                        consecutive_errors += 1
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            logger.warning(
-                                "[%s] %d consecutive tool errors, stopping",
-                                inst.solver_id,
-                                MAX_CONSECUTIVE_ERRORS,
-                            )
-                            break
-                    else:
-                        consecutive_errors = 0
-
-                    loop_status = inst.loop_detector.check(tc.name, tc.arguments)
-                    if loop_status == "warn":
-                        await inst.session.inject_context(LOOP_WARNING_MESSAGE)
-                    elif loop_status == "break":
-                        return SolverResult(
-                            solver_id=inst.solver_id,
-                            status=ResultStatus.LOOP_DETECTED,
-                            flag=inst.flag,
-                            steps=inst.step_count,
-                            duration=time.monotonic() - t0,
-                            cost_usd=inst.cost_usd,
-                            trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
-                            findings_summary=inst.findings,
-                        )
-
-                message = ""
-                pending_tool_results = tool_results if tool_results else None
-
-            if inst.confirmed and inst.flag:
-                result = SolverResult(
+        while not self.cancel_event.is_set():
+            if inst.step_count >= self.settings.max_steps:
+                break
+            elapsed = time.monotonic() - t0
+            if elapsed >= self.settings.timeout:
+                return SolverResult(
                     solver_id=inst.solver_id,
-                    status=ResultStatus.SOLVED,
+                    status=ResultStatus.TIMEOUT,
                     flag=inst.flag,
                     steps=inst.step_count,
-                    duration=time.monotonic() - t0,
+                    duration=elapsed,
                     cost_usd=inst.cost_usd,
                     trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
                     findings_summary=inst.findings,
                 )
-                return result
+            if self.cost_tracker.is_over_budget(self.settings.max_cost):
+                break
 
-            result = SolverResult(
+            cb = self._circuit_breakers.get(inst.provider_name)
+            if cb and not cb.is_available():
+                break
+
+            if inst.step_count > 0 and inst.step_count % 5 == 0:
+                insights_text = await do_check_findings(self.message_bus, inst.solver_id)
+                if insights_text and "No new findings" not in insights_text:
+                    await inst.session.inject_context(insights_text)
+                    inst.loop_detector.reset()
+
+            try:
+                _msg, _presults = message, pending_tool_results
+                response = await retry_with_backoff(
+                    lambda m=_msg, p=_presults: inst.session.send(m, tool_results=p),
+                    max_retries=3,
+                    base_delay=1.0,
+                )
+            except Exception as e:
+                if cb:
+                    cb.record_failure()
+                logger.warning("[%s] LLM call failed: %s", inst.solver_id, e)
+                break
+
+            if cb:
+                cb.record_success()
+
+            self.cost_tracker.record_tokens(
+                inst.solver_id,
+                inst.model_spec,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cache_read_tokens=response.usage.cache_read_tokens,
+                provider_spec=inst.provider_name,
+            )
+            step_cost = self.cost_tracker.by_agent.get(inst.solver_id)
+            if step_cost:
+                inst.cost_usd = step_cost.cost_usd
+            self.event_bus.publish(SolverEvent(type="cost_update", solver_id=inst.solver_id, data={"cost": inst.cost_usd}))
+
+            if inst.tracer:
+                inst.tracer.usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    response.usage.cache_read_tokens,
+                    inst.cost_usd,
+                )
+
+            flags_found = extract_flags(response.text, self.settings.flag_pattern)
+            if flags_found:
+                for flag in flags_found:
+                    msg_text, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, self._submitted_flags)
+                    if is_valid:
+                        inst.flag = flag
+                        inst.confirmed = True
+                        async with self._flag_lock:
+                            if not self.confirmed_flag:
+                                self.confirmed_flag = flag
+                                self.winner_id = inst.solver_id
+
+            if response.done or not response.tool_calls:
+                break
+
+            tool_results: list[ToolResult] = []
+            consecutive_errors = 0
+            for tc in response.tool_calls:
+                inst.step_count += 1
+                if inst.tracer:
+                    inst.tracer.tool_call(tc.name, tc.arguments, inst.step_count)
+                result_str = await self._execute_tool(inst, tc)
+                if inst.tracer:
+                    inst.tracer.tool_result(tc.name, result_str, inst.step_count)
+                tool_results.append(ToolResult(content=result_str))
+
+                if "Error" in result_str or "error" in result_str.lower():
+                    consecutive_errors += 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        logger.warning(
+                            "[%s] %d consecutive tool errors, stopping",
+                            inst.solver_id,
+                            MAX_CONSECUTIVE_ERRORS,
+                        )
+                        break
+                else:
+                    consecutive_errors = 0
+
+                loop_status = inst.loop_detector.check(tc.name, tc.arguments)
+                if loop_status == "warn":
+                    await inst.session.inject_context(LOOP_WARNING_MESSAGE)
+                elif loop_status == "break":
+                    return SolverResult(
+                        solver_id=inst.solver_id,
+                        status=ResultStatus.LOOP_DETECTED,
+                        flag=inst.flag,
+                        steps=inst.step_count,
+                        duration=time.monotonic() - t0,
+                        cost_usd=inst.cost_usd,
+                        trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
+                        findings_summary=inst.findings,
+                    )
+
+            message = ""
+            pending_tool_results = tool_results if tool_results else None
+
+        if inst.confirmed and inst.flag:
+            return SolverResult(
                 solver_id=inst.solver_id,
-                status=ResultStatus.FAILED,
+                status=ResultStatus.SOLVED,
                 flag=inst.flag,
                 steps=inst.step_count,
                 duration=time.monotonic() - t0,
@@ -341,9 +348,29 @@ class ChallengeSwarm:
                 findings_summary=inst.findings,
             )
 
-            if inst.step_count == 0 and inst.cost_usd == 0.0:
-                logger.warning("[%s] Broken solver — 0 steps, $0 cost", inst.solver_id)
+        result = SolverResult(
+            solver_id=inst.solver_id,
+            status=ResultStatus.FAILED,
+            flag=inst.flag,
+            steps=inst.step_count,
+            duration=time.monotonic() - t0,
+            cost_usd=inst.cost_usd,
+            trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
+            findings_summary=inst.findings,
+        )
 
+        if inst.step_count == 0 and inst.cost_usd == 0.0:
+            logger.warning("[%s] Broken solver — 0 steps, $0 cost", inst.solver_id)
+
+        return result
+
+    async def _run_solver(self, inst: SolverInstance) -> SolverResult | None:
+        t0 = time.monotonic()
+        try:
+            err = await self._init_solver(inst, t0)
+            if err:
+                return err
+            result = await self._run_loop(inst, t0)
             return result
         except NotImplementedError as e:
             logger.warning("[%s] Provider stub: %s", inst.solver_id, e)
@@ -417,6 +444,13 @@ class ChallengeSwarm:
             return await do_check_findings(self.message_bus, inst.solver_id)
         elif name == "notify_coordinator":
             return await do_notify_coordinator(args.get("message", ""), self.event_bus, inst.solver_id)
+        elif name == "view_image":
+            from ctf_solver.tools.vision import do_view_image
+
+            result = await do_view_image(inst.sandbox, args.get("filename", ""), use_vision=True)
+            if isinstance(result, tuple):
+                return f"Image received ({result[1]}), {len(result[0])} bytes"
+            return result
         else:
             return f"Unknown tool: {name}"
 

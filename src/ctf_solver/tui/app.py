@@ -82,6 +82,18 @@ class CTFApp(App):
             if event.type == "solver_done":
                 panel = self.query_one(SolverPanel)
                 panel.mark_done(event.solver_id)
+
+            if event.type == "tool_call":
+                panel = self.query_one(SolverPanel)
+                panel.update_solver(event.solver_id, last_action=event.data.get("tool", ""))
+
+            if event.type == "cost_update":
+                panel = self.query_one(SolverPanel)
+                panel.update_solver(event.solver_id, cost=event.data.get("cost", 0.0))
+
+            if event.type == "flag_found":
+                panel = self.query_one(SolverPanel)
+                panel.update_solver(event.solver_id, last_action=f"FLAG: {event.data}")
         except Exception:
             pass
 
