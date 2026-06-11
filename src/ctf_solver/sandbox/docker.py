@@ -104,6 +104,7 @@ class DockerSandbox:
             logger.info("Sandbox started: %s", self._container.id[:12])
         except Exception:
             sem.release()
+            self._sem_acquired = False
             raise
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
