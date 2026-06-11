@@ -19,6 +19,15 @@ from ctf_solver.sandbox import ExecResult
 logger = logging.getLogger(__name__)
 
 CONTAINER_LABEL = "ctf-agent"
+MAX_CONCURRENT_CONTAINERS = 20
+_container_sem: asyncio.Semaphore | None = None
+
+
+def get_container_semaphore() -> asyncio.Semaphore:
+    global _container_sem
+    if _container_sem is None:
+        _container_sem = asyncio.Semaphore(MAX_CONCURRENT_CONTAINERS)
+    return _container_sem
 
 
 @dataclass
@@ -31,6 +40,7 @@ class DockerSandbox:
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _sem_acquired: bool = field(default=False)
 
     @property
     def container_id(self) -> str:
@@ -57,37 +67,44 @@ class DockerSandbox:
             return default
 
     async def start(self) -> None:
-        self._docker = aiodocker.Docker()
-        self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
-        challenge_root = Path(self.challenge_dir).resolve()
-        distfiles = str(challenge_root / "distfiles")
-        binds: list[str] = [f"{self.workspace_dir}:/challenge/workspace:rw"]
-        if Path(distfiles).exists():
-            binds.append(f"{distfiles}:/challenge/distfiles:ro")
-        config = {
-            "Image": self.image,
-            "Cmd": ["sleep", "infinity"],
-            "WorkingDir": "/challenge",
-            "Tty": False,
-            "Labels": {CONTAINER_LABEL: "true"},
-            "HostConfig": {
-                "Binds": binds,
-                "ExtraHosts": ["host.docker.internal:host-gateway"],
-                "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
-                "SecurityOpt": ["seccomp=unconfined"],
-                "Memory": self._parse_memory_limit(),
-                "NanoCpus": self.cpu_limit * 1_000_000_000,
-            },
-        }
+        sem = get_container_semaphore()
+        await sem.acquire()
+        self._sem_acquired = True
         try:
-            self._container = await self._docker.containers.create(config)
-        except aiodocker.exceptions.DockerError as e:
-            if "No such image" in str(e) or e.status == 404:
-                msg = f"Sandbox image '{self.image}' not found. Build it with:\n  docker build -t {self.image} sandbox/"
-                raise RuntimeError(msg) from e
+            self._docker = aiodocker.Docker()
+            self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
+            challenge_root = Path(self.challenge_dir).resolve()
+            distfiles = str(challenge_root / "distfiles")
+            binds: list[str] = [f"{self.workspace_dir}:/challenge/workspace:rw"]
+            if Path(distfiles).exists():
+                binds.append(f"{distfiles}:/challenge/distfiles:ro")
+            config = {
+                "Image": self.image,
+                "Cmd": ["sleep", "infinity"],
+                "WorkingDir": "/challenge",
+                "Tty": False,
+                "Labels": {CONTAINER_LABEL: "true"},
+                "HostConfig": {
+                    "Binds": binds,
+                    "ExtraHosts": ["host.docker.internal:host-gateway"],
+                    "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
+                    "SecurityOpt": ["seccomp=unconfined"],
+                    "Memory": self._parse_memory_limit(),
+                    "NanoCpus": self.cpu_limit * 1_000_000_000,
+                },
+            }
+            try:
+                self._container = await self._docker.containers.create(config)
+            except aiodocker.exceptions.DockerError as e:
+                if "No such image" in str(e) or e.status == 404:
+                    msg = f"Sandbox image '{self.image}' not found. Build it with:\n  docker build -t {self.image} sandbox/"
+                    raise RuntimeError(msg) from e
+                raise
+            await self._container.start()
+            logger.info("Sandbox started: %s", self._container.id[:12])
+        except Exception:
+            sem.release()
             raise
-        await self._container.start()
-        logger.info("Sandbox started: %s", self._container.id[:12])
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
         if not self._container:
@@ -182,8 +199,13 @@ class DockerSandbox:
             self._docker = None
         if self.workspace_dir:
             import shutil
+
             shutil.rmtree(self.workspace_dir, ignore_errors=True)
             self.workspace_dir = ""
+        if self._sem_acquired:
+            sem = get_container_semaphore()
+            sem.release()
+            self._sem_acquired = False
         logger.info("Sandbox stopped")
 
 

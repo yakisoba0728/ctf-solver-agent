@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ class SolverTracer:
         self.path = str(Path(log_dir) / f"{safe_name}-{model_id}-{timestamp}.jsonl")
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         self._file = open(self.path, "a")  # noqa: SIM115
+        atexit.register(self.close)
 
     def _write(self, data: dict) -> None:
         data["ts"] = time.time()

@@ -6,7 +6,8 @@ from ctf_solver.tracking.cost_tracker import CostTracker
 def test_record_and_total():
     ct = CostTracker()
     ct.record_tokens("solver-1", "claude-opus-4-6", input_tokens=1000, output_tokens=500, provider_spec="claude-sdk")
-    assert ct.total_cost_usd >= 0
+    expected = (1000 * 5.0 + 500 * 25.0) / 1_000_000
+    assert abs(ct.total_cost_usd - expected) < 0.001
     assert ct.total_tokens == 1500
 
 
