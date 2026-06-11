@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import shlex
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -61,11 +63,14 @@ async def do_list_files(sandbox, path: str = "/challenge/distfiles") -> str:
 
 
 async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
-    from urllib.parse import urlparse
-
-    host = urlparse(url).hostname or ""
-    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-        return "Fetch error: access to localhost is blocked."
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return "Fetch error: access to private/local IP addresses is blocked."
+    except ValueError:
+        pass
     try:
         async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
             resp = await client.request(method, url, content=body or None, headers={"User-Agent": "Mozilla/5.0"})

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
-
-logger = logging.getLogger(__name__)
 
 FALLBACK_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": {"input": 5.00, "cached_input": 0.50, "output": 25.00},

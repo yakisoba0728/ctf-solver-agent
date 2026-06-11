@@ -47,6 +47,14 @@ class Settings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
+    def to_provider_config(self) -> dict:
+        return {
+            "anthropic_api_key": self.anthropic_api_key,
+            "openai_api_key": self.openai_api_key,
+            "zai_api_key": self.zai_api_key,
+            "zai_endpoint": self.zai_endpoint,
+        }
+
 
 def validate_provider_config(settings: Settings) -> None:
     """Validate that at least one provider has a positive count."""

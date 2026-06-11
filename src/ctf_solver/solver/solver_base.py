@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ctf_solver.providers.base import TokenUsage
-from ctf_solver.sandbox.docker import SandboxProtocol
+from ctf_solver.sandbox import SandboxProtocol
 
 
 class ResultStatus(Enum):

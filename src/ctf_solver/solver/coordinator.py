@@ -35,12 +35,7 @@ class CoordinatorAgent:
 
     async def start(self) -> None:
         provider = get_provider(self.provider_name)
-        config = {
-            "anthropic_api_key": self.settings.anthropic_api_key,
-            "openai_api_key": self.settings.openai_api_key,
-            "zai_api_key": self.settings.zai_api_key,
-            "zai_endpoint": self.settings.zai_endpoint,
-        }
+        config = self.settings.to_provider_config()
         if not provider.validate_config(config):
             logger.warning("Coordinator provider %s not configured — coordinator disabled", self.provider_name)
             return
@@ -60,7 +55,7 @@ class CoordinatorAgent:
             if not self.swarm:
                 continue
             status = self.swarm.get_status()
-            for solver_id, _info in status.get("solvers", {}).items():
+            for solver_id, _ in status.get("solvers", {}).items():
                 solver = self.swarm.solvers.get(solver_id)
                 if not solver or not solver.tracer:
                     continue
