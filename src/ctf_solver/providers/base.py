@@ -1,0 +1,70 @@
+"""Provider protocol and data models — the interface all AI providers implement."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ToolDef:
+    name: str
+    description: str
+    parameters: dict
+
+
+@dataclass
+class ToolCall:
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ToolResult:
+    content: str | tuple[bytes, str]
+    error: str | None = None
+
+
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+
+
+@dataclass
+class SolverResponse:
+    text: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    structured_output: dict | None = None
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    done: bool = False
+
+
+class SolverSession(ABC):
+    """Active session with an AI provider for one solver instance."""
+
+    @abstractmethod
+    async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse: ...
+
+    @abstractmethod
+    async def inject_context(self, text: str) -> None: ...
+
+    @abstractmethod
+    async def close(self) -> None: ...
+
+
+class ProviderProtocol(ABC):
+    name: str
+
+    @abstractmethod
+    async def create_session(
+        self,
+        solver_id: str,
+        system_prompt: str,
+        tools: list[ToolDef],
+        config: dict,
+    ) -> SolverSession: ...
+
+    @abstractmethod
+    def validate_config(self, config: dict) -> bool: ...
