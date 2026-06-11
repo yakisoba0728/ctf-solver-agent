@@ -29,7 +29,7 @@ def test_dry_run():
         "--dry-run",
     ])
     assert result.exit_code == 0
-    assert "DRY RUN" in result.output or "dry" in result.output.lower()
+    assert "DRY RUN" in result.output
 
 
 def test_mutual_exclusion():
