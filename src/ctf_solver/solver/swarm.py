@@ -38,7 +38,6 @@ class SolverInstance:
     confirmed: bool = False
     findings: str = ""
     cost_usd: float = 0.0
-    _bump_insights: str | None = None
     _wrong_submit_count: int = 0
     _last_submit_time: float = 0.0
 
@@ -137,12 +136,7 @@ class ChallengeSwarm:
             self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
 
             provider = get_provider(inst.provider_name)
-            config = {
-                "anthropic_api_key": self.settings.anthropic_api_key,
-                "openai_api_key": self.settings.openai_api_key,
-                "zai_api_key": self.settings.zai_api_key,
-                "zai_endpoint": self.settings.zai_endpoint,
-            }
+            config = self.settings.to_provider_config()
 
             if not provider.validate_config(config):
                 return SolverResult(
