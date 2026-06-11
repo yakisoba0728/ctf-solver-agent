@@ -40,6 +40,7 @@ class DockerSandbox:
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _sem_acquired: bool = field(default=False)
 
     @property
     def container_id(self) -> str:
@@ -68,6 +69,7 @@ class DockerSandbox:
     async def start(self) -> None:
         sem = get_container_semaphore()
         await sem.acquire()
+        self._sem_acquired = True
         try:
             self._docker = aiodocker.Docker()
             self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
@@ -200,8 +202,10 @@ class DockerSandbox:
 
             shutil.rmtree(self.workspace_dir, ignore_errors=True)
             self.workspace_dir = ""
-        sem = get_container_semaphore()
-        sem.release()
+        if self._sem_acquired:
+            sem = get_container_semaphore()
+            sem.release()
+            self._sem_acquired = False
         logger.info("Sandbox stopped")
 
 
