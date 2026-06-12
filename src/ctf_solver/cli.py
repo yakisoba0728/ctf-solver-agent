@@ -14,7 +14,12 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from ctf_solver.config import Settings, get_coordinator_provider, load_toml_config, validate_provider_config
+from ctf_solver.config import (
+    Settings,
+    get_coordinator_provider,
+    load_toml_config,
+    validate_provider_config,
+)
 from ctf_solver.events import EventBus
 from ctf_solver.session_state import SessionState
 from ctf_solver.solver.swarm import ChallengeSwarm

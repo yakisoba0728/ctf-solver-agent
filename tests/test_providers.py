@@ -3,7 +3,7 @@
 import pytest
 
 from ctf_solver.providers import get_provider
-from ctf_solver.providers.base import SolverSession, ToolDef
+from ctf_solver.providers.base import SolverSession
 from ctf_solver.providers.claude import ClaudeProvider, ClaudeSession
 from ctf_solver.providers.codex import CodexProvider, CodexSession
 from ctf_solver.providers.zai import ZAIProvider, ZAISession
