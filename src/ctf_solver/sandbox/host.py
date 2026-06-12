@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -11,17 +12,48 @@ from ctf_solver.sandbox import ExecResult
 
 class HostSandbox:
     def __init__(self, challenge_dir: str = "") -> None:
-        self.challenge_dir = challenge_dir
+        self.challenge_dir = str(Path(challenge_dir).resolve())
         self._workspace_dir = ""
 
     @property
     def container_id(self) -> str:
         return "host"
 
+    @property
+    def _distfiles_dir(self) -> Path:
+        return Path(self.challenge_dir) / "distfiles"
+
+    @property
+    def _workspace_path(self) -> Path:
+        return Path(self._workspace_dir) if self._workspace_dir else Path(self.challenge_dir) / "workspace"
+
+    def _map_path(self, path: str) -> Path:
+        if path == "/challenge":
+            return Path(self.challenge_dir)
+        if path.startswith("/challenge/distfiles/"):
+            return self._distfiles_dir / path.removeprefix("/challenge/distfiles/")
+        if path.startswith("/challenge/workspace/"):
+            return self._workspace_path / path.removeprefix("/challenge/workspace/")
+        if path == "/challenge/distfiles":
+            return self._distfiles_dir
+        if path == "/challenge/workspace":
+            return self._workspace_path
+        p = Path(path)
+        if p.is_absolute():
+            return p
+        return Path(self.challenge_dir) / path
+
+    def _rewrite_command_paths(self, command: str) -> str:
+        command = command.replace("/challenge/distfiles", shlex.quote(str(self._distfiles_dir)))
+        command = command.replace("/challenge/workspace", shlex.quote(str(self._workspace_path)))
+        command = command.replace("/challenge", shlex.quote(self.challenge_dir))
+        return command
+
     async def start(self) -> None:
         self._workspace_dir = tempfile.mkdtemp(prefix="ctf-host-workspace-")
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
+        command = self._rewrite_command_paths(command)
         try:
             proc = await asyncio.create_subprocess_exec(
                 "bash", "-c", command,
@@ -45,9 +77,7 @@ class HostSandbox:
             return ExecResult(exit_code=-1, stdout="", stderr=str(e))
 
     async def read_file(self, path: str) -> str | bytes:
-        p = Path(path)
-        if not p.is_absolute():
-            p = Path(self.challenge_dir) / path
+        p = self._map_path(path)
         try:
             data = p.read_bytes()
             try:
@@ -60,15 +90,11 @@ class HostSandbox:
             raise FileNotFoundError(str(e)) from e
 
     async def read_file_bytes(self, path: str) -> bytes:
-        p = Path(path)
-        if not p.is_absolute():
-            p = Path(self.challenge_dir) / path
+        p = self._map_path(path)
         return p.read_bytes()
 
     async def write_file(self, path: str, content: str | bytes) -> None:
-        p = Path(path)
-        if not p.is_absolute():
-            p = Path(self.challenge_dir) / path
+        p = self._map_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(content, str):
             content = content.encode("utf-8")

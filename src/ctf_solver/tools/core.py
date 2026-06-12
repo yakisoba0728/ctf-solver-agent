@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import shlex
@@ -69,25 +70,38 @@ async def do_list_files(sandbox: SandboxProtocol, path: str = "/challenge/distfi
 
 async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
     parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return "Fetch error: only http/https URLs are allowed."
     host = parsed.hostname or ""
+    if not host:
+        return "Fetch error: missing hostname."
+
+    def _blocked_ip(ip) -> bool:
+        return (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        )
+
     try:
         ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if _blocked_ip(ip):
             return "Fetch error: access to private/local IP addresses is blocked."
     except ValueError:
         pass
     try:
         import socket
-        resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        for _family, _, _, _, sockaddr in resolved:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        for *_rest, sockaddr in infos:
             ip = ipaddress.ip_address(sockaddr[0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return "Fetch error: hostname resolves to private/local IP address."
-    except (socket.gaierror, ValueError):
+            if _blocked_ip(ip):
+                return "Fetch error: hostname resolves to blocked IP address."
+    except Exception:
         pass
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
-            resp = await client.request(method, url, content=body or None, headers={"User-Agent": "Mozilla/5.0"})
+        async with httpx.AsyncClient(verify=True, timeout=30.0, follow_redirects=False) as client:
+            resp = await client.request(method, url, content=body or None, headers={"User-Agent": "ctf-solver-agent/1.0"})
             text = resp.text
             prefix = f"HTTP {resp.status_code} {resp.reason_phrase}\n{'─' * 40}\n"
             if len(text) > WEB_FETCH_MAX:
@@ -128,8 +142,9 @@ async def do_submit_flag(
     flag: str,
     flag_pattern: str,
     submitted_flags: set[str],
+    *,
+    accept_regex_as_verified: bool = False,
 ) -> tuple[str, bool]:
-    """Validate flag against pattern and dedup set. Returns (display_message, is_new_valid)."""
     from ctf_solver.tools.flag import extract_flags
 
     flag = flag.strip()
@@ -141,7 +156,9 @@ async def do_submit_flag(
     if not matches:
         return f"Flag '{flag}' does not match expected pattern.", False
     submitted_flags.add(flag)
-    return f"Flag candidate matches pattern: {flag}", True
+    if accept_regex_as_verified:
+        return f"Flag accepted (regex-only mode): {flag}", True
+    return f"Flag candidate matches pattern but is not externally verified: {flag}", False
 
 
 async def do_notify_coordinator(message: str, event_bus: EventBus | None = None, solver_id: str = "") -> str:

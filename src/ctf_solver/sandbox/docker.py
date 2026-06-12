@@ -87,10 +87,12 @@ class DockerSandbox:
                 "HostConfig": {
                     "Binds": binds,
                     "ExtraHosts": ["host.docker.internal:host-gateway"],
-                    "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
-                    "SecurityOpt": ["seccomp=unconfined"],
+                    "CapDrop": ["ALL"],
+                    "CapAdd": ["SYS_PTRACE", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "CHOWN", "MKNOD"],
+                    "SecurityOpt": ["no-new-privileges:true"],
                     "Memory": self._parse_memory_limit(),
                     "NanoCpus": self.cpu_limit * 1_000_000_000,
+                    "PidsLimit": 512,
                 },
             }
             try:
@@ -132,7 +134,7 @@ class DockerSandbox:
                     data = msg.data
                     if isinstance(data, str):
                         data = data.encode("utf-8")
-                    stream_type = getattr(msg, "extra", 1)
+                    stream_type = getattr(msg, "stream", 1)
                     if stream_type == 1:
                         stdout_chunks.append(data)
                     else:
@@ -152,23 +154,23 @@ class DockerSandbox:
 
     async def read_file(self, path: str) -> str | bytes:
         if not self._container:
-            msg = "Sandbox not started"
-            raise RuntimeError(msg)
+            raise RuntimeError("Sandbox not started")
         try:
             tar = await asyncio.wait_for(self._container.get_archive(path), timeout=30)
         except aiodocker.exceptions.DockerError as e:
             raise FileNotFoundError(str(e)) from e
-        for member in tar:
-            if member.isfile():
-                f = tar.extractfile(member)
-                if f:
+        with tar:
+            for member in tar:
+                if member.isfile():
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
                     file_data = f.read()
                     try:
                         return file_data.decode("utf-8")
                     except UnicodeDecodeError:
                         return file_data
-        msg = f"No file found at {path}"
-        raise FileNotFoundError(msg)
+        raise FileNotFoundError(f"No file found at {path}")
 
     async def read_file_bytes(self, path: str) -> bytes:
         result = await self.read_file(path)
@@ -178,8 +180,9 @@ class DockerSandbox:
 
     async def write_file(self, path: str, content: str | bytes) -> None:
         if not self._container:
-            msg = "Sandbox not started"
-            raise RuntimeError(msg)
+            raise RuntimeError("Sandbox not started")
+        parent = str(Path(path).parent)
+        await self.exec(f"mkdir -p {shlex.quote(parent)}", timeout_s=10)
         if isinstance(content, str):
             content = content.encode("utf-8")
         buf = io.BytesIO()
@@ -189,7 +192,7 @@ class DockerSandbox:
             tar.addfile(info, io.BytesIO(content))
         buf.seek(0)
         await asyncio.wait_for(
-            self._container.put_archive(str(Path(path).parent), buf.getvalue()),
+            self._container.put_archive(parent, buf.getvalue()),
             timeout=30,
         )
 

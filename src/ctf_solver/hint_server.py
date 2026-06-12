@@ -10,26 +10,41 @@ from ctf_solver.events import EventBus, SolverEvent
 
 logger = logging.getLogger(__name__)
 
+MAX_HEADER_BYTES = 8192
+MAX_BODY_BYTES = 65536
+
 
 async def start_hint_server(event_bus: EventBus, port: int = 0) -> tuple[asyncio.Server, int]:
+    async def _json_response(writer: asyncio.StreamWriter, status: int, data: dict) -> None:
+        body = json.dumps(data).encode()
+        writer.write(
+            f"HTTP/1.1 {status} {'OK' if status == 200 else 'Bad Request' if status == 400 else 'Not Found'}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n".encode() + body
+        )
+        await writer.drain()
+
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            header_data = b""
-            while b"\r\n\r\n" not in header_data:
-                chunk = await reader.read(4096)
-                if not chunk:
-                    break
-                header_data += chunk
-
-            header_text = header_data.decode("utf-8", errors="replace")
-            headers_end = header_text.find("\r\n\r\n")
-            if headers_end < 0:
-                writer.close()
+            header_data = await reader.readuntil(b"\r\n\r\n")
+            if len(header_data) > MAX_HEADER_BYTES:
+                await _json_response(writer, 400, {"status": "error", "message": "headers too large"})
                 return
 
-            body_start_raw = header_data[headers_end + 4:]
+            header_part, _, initial_body = header_data.partition(b"\r\n\r\n")
+            header_text = header_part.decode("iso-8859-1")
+            request_line = header_text.split("\r\n")[0]
+            parts = request_line.split(" ", 2)
+            method = parts[0] if len(parts) >= 1 else ""
+            path = parts[1] if len(parts) >= 2 else ""
+
+            if method != "POST" or path != "/hint":
+                await _json_response(writer, 404, {"status": "error", "message": "not found"})
+                return
+
             content_length = 0
-            for line in header_text[:headers_end].split("\r\n"):
+            for line in header_text.split("\r\n")[1:]:
                 if line.lower().startswith("content-length:"):
                     try:
                         content_length = int(line.split(":", 1)[1].strip())
@@ -37,35 +52,31 @@ async def start_hint_server(event_bus: EventBus, port: int = 0) -> tuple[asyncio
                         pass
                     break
 
-            body_data = body_start_raw
+            if content_length > MAX_BODY_BYTES:
+                await _json_response(writer, 400, {"status": "error", "message": "body too large"})
+                return
+
+            body_data = initial_body
             remaining = content_length - len(body_data)
             if remaining > 0:
-                body_data += await reader.readexactly(remaining)
+                body_data += await asyncio.wait_for(reader.readexactly(remaining), timeout=5)
 
-            body = body_data.decode("utf-8", errors="replace")
-
-            if not body:
-                response = json.dumps({"status": "error", "message": "empty body"}).encode()
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
-                await writer.drain()
+            if not body_data:
+                await _json_response(writer, 400, {"status": "error", "message": "empty body"})
                 return
 
             try:
-                body_json = json.loads(body)
+                body_json = json.loads(body_data)
             except json.JSONDecodeError:
-                response = json.dumps({"status": "error", "message": "invalid JSON"}).encode()
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
-                await writer.drain()
+                await _json_response(writer, 400, {"status": "error", "message": "invalid JSON"})
                 return
 
             message = body_json.get("message", "")
             if message:
                 event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": message}))
-                response = json.dumps({"status": "ok", "queued": message[:200]}).encode()
+                await _json_response(writer, 200, {"status": "ok", "queued": message[:200]})
             else:
-                response = json.dumps({"status": "error", "message": "empty message"}).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
-            await writer.drain()
+                await _json_response(writer, 400, {"status": "error", "message": "empty message"})
         except Exception:
             logger.debug("hint_server error handling request", exc_info=True)
         finally:

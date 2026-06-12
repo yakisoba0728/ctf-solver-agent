@@ -51,7 +51,7 @@ class EventBus:
             pass
 
     def publish(self, event: SolverEvent) -> None:
-        for q in self._subscribers:
+        for q in list(self._subscribers):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:

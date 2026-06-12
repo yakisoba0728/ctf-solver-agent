@@ -37,7 +37,6 @@ class ZAISession(SolverSession):
         if system_prompt:
             self._messages.append({"role": "system", "content": system_prompt})
         self._pending_context: str | None = None
-        self._pending_images: list[dict] = []
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -47,30 +46,47 @@ class ZAISession(SolverSession):
 
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
         if tool_results:
+            pending_image_parts: list[dict] = []
             for tr in tool_results:
-                content = tr.content if isinstance(tr.content, str) else str(tr.content)
+                if isinstance(tr.content, tuple):
+                    image_data, mime_type = tr.content
+                    b64 = base64.b64encode(image_data).decode("ascii")
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr.call_id,
+                        "content": "Image loaded. See next message.",
+                    })
+                    pending_image_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                    })
+                else:
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr.call_id,
+                        "content": tr.content,
+                    })
+            if pending_image_parts:
                 self._messages.append({
-                    "role": "tool",
-                    "tool_call_id": tr.call_id,
-                    "content": content,
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze the attached image from the tool result."},
+                        *pending_image_parts,
+                    ],
                 })
         elif message:
-            if self._pending_images:
-                content_parts: list[dict] = [{"type": "text", "text": message}]
-                content_parts.extend(self._pending_images)
-                self._pending_images = []
-                self._messages.append({"role": "user", "content": content_parts})
-            else:
-                self._messages.append({"role": "user", "content": message})
+            self._messages.append({"role": "user", "content": message})
 
         if self._pending_context:
-            last_user = None
-            for i in range(len(self._messages) - 1, -1, -1):
-                if self._messages[i]["role"] == "user":
-                    last_user = i
-                    break
-            if last_user is not None:
-                self._messages[last_user]["content"] += f"\n\n{self._pending_context}"
+            if self._messages:
+                last = self._messages[-1]
+                if last.get("role") == "user":
+                    if isinstance(last["content"], str):
+                        last["content"] += f"\n\n{self._pending_context}"
+                    elif isinstance(last["content"], list):
+                        last["content"].append({"type": "text", "text": self._pending_context})
+            else:
+                self._messages.append({"role": "user", "content": self._pending_context})
             self._pending_context = None
 
         body: dict[str, Any] = {
@@ -122,13 +138,6 @@ class ZAISession(SolverSession):
 
     async def inject_context(self, text: str) -> None:
         self._pending_context = text
-
-    async def inject_image(self, data: bytes, mime_type: str) -> None:
-        b64 = base64.b64encode(data).decode("ascii")
-        self._pending_images.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-        })
 
     async def close(self) -> None:
         if self._client:

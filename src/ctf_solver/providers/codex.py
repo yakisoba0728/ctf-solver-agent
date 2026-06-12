@@ -128,11 +128,10 @@ class CodexSession(SolverSession):
         self._thread_id: str | None = None
         self._msg_id = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
-        self._tool_call_queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._tool_result_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._tool_request_ids: dict[str, int] = {}
+        self._tool_call_queue: asyncio.Queue[ToolCall] = asyncio.Queue()
         self._text_buffer: str = ""
         self._usage: TokenUsage = TokenUsage()
-        self._done = False
         self._read_task: asyncio.Task | None = None
         self._turn_done_event = asyncio.Event()
         self._pending_context: str | None = None
@@ -169,21 +168,34 @@ class CodexSession(SolverSession):
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id")
 
     async def _rpc(self, method: str, params: dict) -> dict:
+        if not self._proc or not self._proc.stdin:
+            raise RuntimeError("Codex process is not running")
         self._msg_id += 1
         msg_id = self._msg_id
-        request = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params}
-        line = json.dumps(request) + "\n"
-        self._proc.stdin.write(line.encode())
-        await self._proc.stdin.drain()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending_responses[msg_id] = future
-        return await asyncio.wait_for(future, timeout=300.0)
+        request = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params}
+        try:
+            self._proc.stdin.write((json.dumps(request) + "\n").encode())
+            await self._proc.stdin.drain()
+            return await asyncio.wait_for(future, timeout=300.0)
+        except Exception:
+            self._pending_responses.pop(msg_id, None)
+            raise
 
     async def _send_notification(self, method: str, params: dict) -> None:
+        if not self._proc or not self._proc.stdin:
+            return
         notification = {"jsonrpc": "2.0", "method": method, "params": params}
-        line = json.dumps(notification) + "\n"
-        self._proc.stdin.write(line.encode())
+        self._proc.stdin.write((json.dumps(notification) + "\n").encode())
+        await self._proc.stdin.drain()
+
+    async def _send_rpc_response(self, msg_id: int, result: dict) -> None:
+        if not self._proc or not self._proc.stdin:
+            return
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": result}
+        self._proc.stdin.write((json.dumps(response) + "\n").encode())
         await self._proc.stdin.drain()
 
     async def _read_loop(self) -> None:
@@ -196,15 +208,37 @@ class CodexSession(SolverSession):
                     msg = json.loads(line.decode())
                 except json.JSONDecodeError:
                     continue
+
                 if "id" in msg and "result" in msg:
                     future = self._pending_responses.pop(msg["id"], None)
                     if future and not future.done():
                         future.set_result(msg)
+                elif "id" in msg and "error" in msg:
+                    future = self._pending_responses.pop(msg["id"], None)
+                    if future and not future.done():
+                        future.set_exception(
+                            RuntimeError(json.dumps(msg["error"], ensure_ascii=False))
+                        )
                 elif "method" in msg:
-                    method = msg["method"]
+                    method = msg.get("method", "")
                     params = msg.get("params", {})
+                    msg_id = msg.get("id")
+
                     if method == "item/tool/call":
-                        await self._tool_call_queue.put(params)
+                        call_id = params.get("callId", "")
+                        tool_name = params.get("tool", "")
+                        if isinstance(tool_name, dict):
+                            tool_name = tool_name.get("name", "")
+                        arguments = params.get("arguments", {})
+                        if not isinstance(arguments, dict):
+                            arguments = {}
+
+                        if call_id and msg_id is not None:
+                            self._tool_request_ids[call_id] = msg_id
+
+                        await self._tool_call_queue.put(
+                            ToolCall(name=tool_name, arguments=arguments, call_id=call_id)
+                        )
                     elif method == "item/completed":
                         text = ""
                         for item in params.get("item", {}).get("content", []):
@@ -231,16 +265,16 @@ class CodexSession(SolverSession):
 
         if tool_results:
             for tr in tool_results:
-                content = tr.content if isinstance(tr.content, str) else str(tr.content)
-                call_id = tr.call_id
-                await self._rpc(
-                    "item/tool/call/response",
-                    {
-                        "threadId": self._thread_id,
-                        "callId": call_id,
-                        "response": {"contentItems": [{"type": "text", "text": content}]},
-                    },
-                )
+                content = tr.content if isinstance(tr.content, str) else "Binary/image result"
+                request_id = self._tool_request_ids.pop(tr.call_id, None)
+                if request_id is not None:
+                    await self._send_rpc_response(request_id, {
+                        "contentItems": [{"type": "inputText", "text": content}],
+                        "success": tr.error is None,
+                    })
+                else:
+                    logger.warning("No stored request id for tool call %s", tr.call_id)
+            return SolverResponse(text="", tool_calls=[], usage=self._usage, done=False)
 
         prompt_text = message
         if self._pending_context:
@@ -257,15 +291,11 @@ class CodexSession(SolverSession):
             },
         )
 
-        tool_calls = []
+        tool_calls: list[ToolCall] = []
         while not self._turn_done_event.is_set():
             try:
-                params = await asyncio.wait_for(self._tool_call_queue.get(), timeout=1.0)
-                call_id = params.get("callId", "")
-                tc = params.get("tool", {})
-                name = tc.get("name", "")
-                args = tc.get("arguments", {})
-                tool_calls.append(ToolCall(name=name, arguments=args, call_id=call_id))
+                tc = await asyncio.wait_for(self._tool_call_queue.get(), timeout=1.0)
+                tool_calls.append(tc)
             except TimeoutError:
                 continue
 

@@ -248,7 +248,7 @@ def main(
     signal.signal(signal.SIGINT, handle_sigint)
 
     if no_tui:
-        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port, sigint_triggered))
+        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port, sigint_triggered, coordinator_provider=coord))
         from ctf_solver.writeup import generate_writeup
 
         if result and result.flag:
@@ -260,7 +260,11 @@ def main(
         else:
             console.print("\n[red]No flag found.[/red]")
         if result:
-            generate_writeup(output_dir or chall_dir, Path(chall_dir).name, category, result)
+            generate_writeup(
+                output_dir or chall_dir, Path(chall_dir).name, category, result,
+                total_cost_usd=swarm.cost_tracker.total_cost_usd,
+                total_solvers=len(swarm.solvers),
+            )
     else:
         from ctf_solver.tui.app import CTFApp
 
@@ -297,7 +301,11 @@ def main(
             await hint_server.wait_closed()
             result = await swarm_task
             if result:
-                generate_writeup(output_dir or chall_dir, Path(chall_dir).name, category, result)
+                generate_writeup(
+                    output_dir or chall_dir, Path(chall_dir).name, category, result,
+                    total_cost_usd=swarm.cost_tracker.total_cost_usd,
+                    total_solvers=len(swarm.solvers),
+                )
             return result
 
         result = asyncio.run(run_with_tui())
@@ -312,99 +320,106 @@ async def _run_cli(
     interactive: bool,
     port: int,
     sigint_triggered: list[bool],
+    coordinator_provider: str | None = None,
 ) -> object:
     from ctf_solver.events import SolverEvent
     from ctf_solver.hint_server import start_hint_server
 
-    hint_server, hint_port = await start_hint_server(event_bus, port)
-    console.print(f"  Hint endpoint: port {hint_port}")
-    console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
-
+    hint_server = None
     coordinator = None
-    coord_provider = get_coordinator_provider(settings)
-    if coord_provider:
-        from ctf_solver.solver.coordinator import CoordinatorAgent
-
-        coordinator = CoordinatorAgent(
-            provider_name=coord_provider,
-            settings=settings,
-            event_bus=event_bus,
-            cost_tracker=swarm.cost_tracker,
-            message_bus=swarm.message_bus,
-            swarm=swarm,
-        )
-
-    queue = event_bus.subscribe()
-
-    async def print_events() -> None:
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=1.0)
-                if event.type == "solver_started":
-                    console.print(f"[green]\u25b6 {event.solver_id} started[/green]")
-                elif event.type == "solver_done":
-                    console.print(f"[blue]\u25cb {event.solver_id} done[/blue]")
-                elif event.type == "flag_found":
-                    console.print(f"[bold yellow]\u2691 {event.solver_id}: {event.data}[/bold yellow]")
-                elif event.type == "cost_update":
-                    pass
-                else:
-                    console.print(f"  [{event.solver_id}] {event.type}")
-            except TimeoutError:
-                continue
-
-    events_task = asyncio.create_task(print_events())
-
-    stdin_task: asyncio.Task | None = None
-    if interactive:
-        loop = asyncio.get_running_loop()
-
-        async def read_stdin() -> None:
-            while True:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-                if not line:
-                    break
-                hint_text = line.strip()
-                if hint_text:
-                    event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": hint_text}))
-
-        stdin_task = asyncio.create_task(read_stdin())
-
-    if coordinator:
-        await coordinator.start()
-
-    result = await swarm.run()
-
-    if coordinator:
-        await coordinator.stop()
-
-    if sigint_triggered[0] and result is None:
-        best: object = None
-        for sid, inst in swarm.solvers.items():
-            if inst.flag:
-                from ctf_solver.solver.solver_base import ResultStatus, SolverResult
-
-                best = SolverResult(
-                    solver_id=sid,
-                    status=ResultStatus.CANCELLED,
-                    flag=inst.flag,
-                    steps=inst.step_count,
-                    duration=0.0,
-                    cost_usd=inst.cost_usd,
-                    findings_summary=inst.findings,
-                )
-                break
-        result = best
+    queue = None
+    events_task = None
+    stdin_task = None
 
     try:
-        events_task.cancel()
-        if stdin_task:
-            stdin_task.cancel()
-        hint_server.close()
-        await hint_server.wait_closed()
-    except Exception:
-        pass
-    return result
+        hint_server, hint_port = await start_hint_server(event_bus, port)
+        console.print(f"  Hint endpoint: port {hint_port}")
+        console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
+
+        if coordinator_provider:
+            from ctf_solver.solver.coordinator import CoordinatorAgent
+
+            coordinator = CoordinatorAgent(
+                provider_name=coordinator_provider,
+                settings=settings,
+                event_bus=event_bus,
+                cost_tracker=swarm.cost_tracker,
+                message_bus=swarm.message_bus,
+                swarm=swarm,
+            )
+            await coordinator.start()
+
+        queue = event_bus.subscribe()
+
+        async def print_events() -> None:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    if event.type == "solver_started":
+                        console.print(f"[green]\u25b6 {event.solver_id} started[/green]")
+                    elif event.type == "solver_done":
+                        console.print(f"[blue]\u25cb {event.solver_id} done[/blue]")
+                    elif event.type == "flag_found":
+                        console.print(f"[bold yellow]\u2691 {event.solver_id}: {event.data}[/bold yellow]")
+                    elif event.type == "flag_candidate":
+                        flag = event.data.get("flag", "")
+                        verified = event.data.get("verified", False)
+                        color = "green" if verified else "yellow"
+                        console.print(f"[{color}]\u2691 {event.solver_id}: {flag} (verified={verified})[/{color}]")
+                    elif event.type == "cost_update":
+                        pass
+                    else:
+                        console.print(f"  [{event.solver_id}] {event.type}")
+                except TimeoutError:
+                    continue
+
+        events_task = asyncio.create_task(print_events())
+
+        if interactive:
+            loop = asyncio.get_running_loop()
+
+            async def read_stdin() -> None:
+                while True:
+                    line = await loop.run_in_executor(None, sys.stdin.readline)
+                    if not line:
+                        break
+                    hint_text = line.strip()
+                    if hint_text:
+                        event_bus.publish(SolverEvent(type="user_hint", solver_id="operator", data={"message": hint_text}))
+
+            stdin_task = asyncio.create_task(read_stdin())
+
+        result = await swarm.run()
+
+        if sigint_triggered[0] and result is None:
+            for sid, inst in swarm.solvers.items():
+                if inst.flag:
+                    from ctf_solver.solver.solver_base import ResultStatus, SolverResult
+
+                    result = SolverResult(
+                        solver_id=sid,
+                        status=ResultStatus.CANCELLED,
+                        flag=inst.flag,
+                        steps=inst.step_count,
+                        duration=0.0,
+                        cost_usd=inst.cost_usd,
+                        findings_summary=inst.findings,
+                    )
+                    break
+
+        return result
+    finally:
+        if coordinator:
+            await coordinator.stop()
+        for task in (events_task, stdin_task):
+            if task:
+                task.cancel()
+        await asyncio.gather(*(t for t in (events_task, stdin_task) if t), return_exceptions=True)
+        if queue:
+            event_bus.unsubscribe(queue)
+        if hint_server:
+            hint_server.close()
+            await hint_server.wait_closed()
 
 
 @click.command()

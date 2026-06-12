@@ -41,7 +41,6 @@ async def test_docker_start_and_stop():
     )
     await s.start()
     assert s.container_id
-    cid = s.container_id
     await s.stop()
     assert s._container is None
 
@@ -109,7 +108,7 @@ async def test_docker_exec_python3(sandbox: DockerSandbox):
 
 
 @pytest.mark.asyncio
-async def test_docker_exec_cTF_tools_available(sandbox: DockerSandbox):
+async def test_docker_exec_ctf_tools_available(sandbox: DockerSandbox):
     tools = ["python3", "gdb", "radare2", "strings", "file", "nmap", "curl", "jq"]
     for tool in tools:
         result = await sandbox.exec(f"which {tool}")

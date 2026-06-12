@@ -192,6 +192,15 @@ class ChallengeSwarm:
     def _create_circuit_breakers(self) -> dict[str, CircuitBreaker]:
         return {name: CircuitBreaker() for name, _ in get_active_providers(self.settings)}
 
+    def _model_spec_for(self, provider_name: str) -> str:
+        if provider_name == "claude":
+            return self.settings.claude_model
+        if provider_name == "codex":
+            return self.settings.codex_model
+        if provider_name == "zai":
+            return self.settings.zai_model
+        return provider_name
+
     def _create_solvers(self) -> list[SolverInstance]:
         instances = []
         for provider_name, count in get_active_providers(self.settings):
@@ -209,7 +218,7 @@ class ChallengeSwarm:
                 instance = SolverInstance(
                     solver_id=solver_id,
                     provider_name=provider_name,
-                    model_spec=f"{provider_name}/default",
+                    model_spec=self._model_spec_for(provider_name),
                     sandbox=sandbox,
                 )
                 instances.append(instance)
@@ -266,10 +275,9 @@ class ChallengeSwarm:
 
     async def _init_solver(self, inst: SolverInstance, t0: float) -> SolverResult | None:
         if not self.settings.no_docker:
+            docker = aiodocker.Docker()
             try:
-                docker = aiodocker.Docker()
                 await docker.version()
-                await docker.close()
             except Exception:
                 return SolverResult(
                     solver_id=inst.solver_id,
@@ -279,6 +287,11 @@ class ChallengeSwarm:
                     duration=time.monotonic() - t0,
                     error="Docker is not running. Start Docker and try again.",
                 )
+            finally:
+                try:
+                    await docker.close()
+                except Exception:
+                    pass
 
         await inst.sandbox.start()
         self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
@@ -360,7 +373,17 @@ class ChallengeSwarm:
                 if cb:
                     cb.record_failure()
                 logger.warning("[%s] LLM call failed: %s", inst.solver_id, e)
-                break
+                return SolverResult(
+                    solver_id=inst.solver_id,
+                    status=ResultStatus.ERROR,
+                    flag=inst.flag,
+                    steps=inst.step_count,
+                    duration=time.monotonic() - t0,
+                    cost_usd=inst.cost_usd,
+                    trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
+                    findings_summary=inst.findings,
+                    error=str(e),
+                )
 
             if cb:
                 cb.record_success()
@@ -389,7 +412,11 @@ class ChallengeSwarm:
             flags_found = extract_flags(response.text, self.settings.flag_pattern)
             if flags_found:
                 for flag in flags_found:
-                    msg_text, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, self._submitted_flags)
+                    msg_text, is_valid = await do_submit_flag(
+                        flag, self.settings.flag_pattern, self._submitted_flags,
+                        accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
+                    )
+                    self.event_bus.publish(SolverEvent(type="flag_candidate", solver_id=inst.solver_id, data={"flag": flag, "verified": is_valid}))
                     if is_valid:
                         inst.flag = flag
                         inst.confirmed = True
@@ -406,21 +433,28 @@ class ChallengeSwarm:
                 inst.step_count += 1
                 if inst.tracer:
                     inst.tracer.tool_call(tc.name, tc.arguments, inst.step_count)
-                result_str = await self._execute_tool(inst, tc)
-                if inst.tracer:
-                    inst.tracer.tool_result(tc.name, result_str, inst.step_count)
-                tr = ToolResult(content=result_str, tool_use_id=tc.call_id, call_id=tc.call_id)
+                tr = await self._execute_tool(inst, tc)
                 tool_results.append(tr)
 
-                if "Error" in result_str or "error" in result_str.lower():
+                trace_content = tr.content if isinstance(tr.content, str) else f"<image {tr.content[1]}>"
+                if inst.tracer:
+                    inst.tracer.tool_result(tc.name, trace_content, inst.step_count)
+
+                if tr.error:
                     inst.consecutive_errors += 1
                     if inst.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        logger.warning(
-                            "[%s] %d consecutive tool errors, stopping",
-                            inst.solver_id,
-                            MAX_CONSECUTIVE_ERRORS,
+                        logger.warning("[%s] %d consecutive tool errors, stopping", inst.solver_id, MAX_CONSECUTIVE_ERRORS)
+                        return SolverResult(
+                            solver_id=inst.solver_id,
+                            status=ResultStatus.ERROR,
+                            flag=inst.flag,
+                            steps=inst.step_count,
+                            duration=time.monotonic() - t0,
+                            cost_usd=inst.cost_usd,
+                            trace_path=Path(inst.tracer.path) if inst.tracer else Path(),
+                            findings_summary=inst.findings,
+                            error=f"{MAX_CONSECUTIVE_ERRORS} consecutive tool errors",
                         )
-                        break
                 else:
                     inst.consecutive_errors = 0
 
@@ -508,20 +542,35 @@ class ChallengeSwarm:
             )
         finally:
             if inst.session:
-                await inst.session.close()
-            await inst.sandbox.stop()
+                try:
+                    await inst.session.close()
+                except Exception:
+                    logger.warning("[%s] Failed to close provider session", inst.solver_id, exc_info=True)
+            try:
+                await inst.sandbox.stop()
+            except Exception:
+                logger.warning("[%s] Failed to stop sandbox", inst.solver_id, exc_info=True)
             if inst.tracer:
-                inst.tracer.close()
+                try:
+                    inst.tracer.close()
+                except Exception:
+                    pass
             self.event_bus.publish(SolverEvent(type="solver_done", solver_id=inst.solver_id, data={}))
 
-    async def _execute_tool(self, inst: SolverInstance, tc: ToolCall) -> str:
+    async def _execute_tool(self, inst: SolverInstance, tc: ToolCall) -> ToolResult:
         try:
-            return await self._execute_tool_inner(inst, tc)
+            raw = await self._execute_tool_inner(inst, tc)
+            return ToolResult(content=raw, tool_use_id=tc.call_id, call_id=tc.call_id)
         except Exception as e:
-            logger.warning("[%s] Tool %s raised: %s", inst.solver_id, tc.name, e)
-            return f"Tool error: {e}"
+            logger.warning("[%s] Tool %s raised: %s", inst.solver_id, tc.name, e, exc_info=True)
+            return ToolResult(
+                content=f"Tool error: {e}",
+                error=str(e),
+                tool_use_id=tc.call_id,
+                call_id=tc.call_id,
+            )
 
-    async def _execute_tool_inner(self, inst: SolverInstance, tc: ToolCall) -> str:
+    async def _execute_tool_inner(self, inst: SolverInstance, tc: ToolCall) -> str | tuple[bytes, str]:
         name = tc.name
         args = tc.arguments
 
@@ -544,7 +593,10 @@ class ChallengeSwarm:
             cooled, msg_text = self._check_cooldown(inst)
             if not cooled:
                 return msg_text
-            result, is_valid = await do_submit_flag(flag, self.settings.flag_pattern, self._submitted_flags)
+            result, is_valid = await do_submit_flag(
+                flag, self.settings.flag_pattern, self._submitted_flags,
+                accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
+            )
             if is_valid:
                 inst.flag = flag
                 inst.confirmed = True
@@ -562,13 +614,7 @@ class ChallengeSwarm:
         elif name == "view_image":
             from ctf_solver.tools.vision import do_view_image
 
-            result = await do_view_image(inst.sandbox, args.get("filename", ""), use_vision=True)
-            if isinstance(result, tuple):
-                image_data, mime_type = result
-                if inst.session:
-                    await inst.session.inject_image(image_data, mime_type)
-                return f"Image loaded ({mime_type}, {len(image_data)} bytes). Analyze the image above."
-            return result
+            return await do_view_image(inst.sandbox, args.get("filename", ""), use_vision=True)
         else:
             return f"Unknown tool: {name}"
 

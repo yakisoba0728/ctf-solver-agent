@@ -85,7 +85,7 @@ def build_prompt(
             ext = Path(name).suffix.lower()
             is_img = ext in IMAGE_EXTS
             suffix = " <- IMAGE: use steghide/exiftool/strings via bash" if is_img else ""
-            lines.append(f"- `/challenge/distfiles/{name}{suffix}`")
+            lines.append(f"- `/challenge/distfiles/{name}`{suffix}")
         lines.append("")
 
     if meta.hints:

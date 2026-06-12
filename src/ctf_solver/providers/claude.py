@@ -21,6 +21,14 @@ from ctf_solver.providers.base import (
 logger = logging.getLogger(__name__)
 
 
+def _claude_tool_content(content: str | tuple[bytes, str]) -> str | list[dict]:
+    if isinstance(content, str):
+        return content
+    image_data, mime_type = content
+    return [{"type": "text", "text": f"Image ({mime_type}, {len(image_data)} bytes):"},
+            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": base64.b64encode(image_data).decode("ascii")}}]
+
+
 def _tools_to_anthropic(tools: list[ToolDef]) -> list[dict]:
     return [
         {"name": t.name, "description": t.description, "input_schema": t.parameters}
@@ -37,7 +45,6 @@ class ClaudeSession(SolverSession):
         self._messages: list[dict] = []
         self._system_prompt = system_prompt
         self._pending_context: str | None = None
-        self._pending_images: list[dict] = []
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -49,32 +56,27 @@ class ClaudeSession(SolverSession):
         if tool_results:
             content_blocks = []
             for tr in tool_results:
-                content = tr.content if isinstance(tr.content, str) else str(tr.content)
-                content_blocks.append({
+                block = {
                     "type": "tool_result",
                     "tool_use_id": tr.tool_use_id or tr.call_id,
-                    "content": content,
-                })
+                    "content": _claude_tool_content(tr.content),
+                }
+                if tr.error:
+                    block["is_error"] = True
+                content_blocks.append(block)
             self._messages.append({"role": "user", "content": content_blocks})
         elif message:
-            if self._pending_images:
-                content_parts: list[dict] = [{"type": "text", "text": message}]
-                content_parts.extend(self._pending_images)
-                self._pending_images = []
-                self._messages.append({"role": "user", "content": content_parts})
-            else:
-                self._messages.append({"role": "user", "content": message})
+            self._messages.append({"role": "user", "content": message})
 
         if self._pending_context:
-            last_user_idx = None
-            for i in range(len(self._messages) - 1, -1, -1):
-                if self._messages[i]["role"] == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx is not None:
-                entry = self._messages[last_user_idx]
-                if isinstance(entry["content"], str):
-                    entry["content"] += f"\n\n{self._pending_context}"
+            if self._messages and self._messages[-1].get("role") == "user":
+                last = self._messages[-1]
+                if isinstance(last["content"], str):
+                    last["content"] += f"\n\n{self._pending_context}"
+                elif isinstance(last["content"], list):
+                    last["content"].append({"type": "text", "text": self._pending_context})
+            else:
+                self._messages.append({"role": "user", "content": self._pending_context})
             self._pending_context = None
 
         body: dict[str, Any] = {
@@ -132,16 +134,6 @@ class ClaudeSession(SolverSession):
 
     async def inject_context(self, text: str) -> None:
         self._pending_context = text
-
-    async def inject_image(self, data: bytes, mime_type: str) -> None:
-        self._pending_images.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime_type,
-                "data": base64.b64encode(data).decode("ascii"),
-            },
-        })
 
     async def close(self) -> None:
         if self._client:

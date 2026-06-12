@@ -128,6 +128,18 @@ async def test_do_submit_flag_valid():
     msg, valid = await do_submit_flag(
         "FLAG{test}", r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}", flags
     )
+    assert valid is False
+    assert "FLAG{test}" in flags
+    assert "not externally verified" in msg
+
+
+@pytest.mark.asyncio
+async def test_do_submit_flag_valid_regex_mode():
+    flags: set[str] = set()
+    msg, valid = await do_submit_flag(
+        "FLAG{test}", r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}", flags,
+        accept_regex_as_verified=True,
+    )
     assert valid is True
     assert "FLAG{test}" in flags
 

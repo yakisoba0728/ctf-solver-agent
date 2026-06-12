@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     flag_pattern: str = r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"
 
     # Hints
+    accept_regex_flag_as_verified: bool = False
     hint: str = ""
     interactive: bool = False
 

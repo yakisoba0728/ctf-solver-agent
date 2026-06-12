@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ctf_solver.collaboration.message_bus import ChallengeMessageBus
-from ctf_solver.events import EventBus
+from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.providers import get_provider
 from ctf_solver.providers.base import SolverSession
 from ctf_solver.tracking.cost_tracker import CostTracker
@@ -76,9 +76,15 @@ class CoordinatorAgent:
                     response = await self.session.send(guidance_prompt)
                     if response.text:
                         await self.message_bus.broadcast("coordinator", response.text[:500])
+                        self.event_bus.publish(SolverEvent(
+                            type="coordinator_guidance",
+                            solver_id="coordinator",
+                            data={"guidance": response.text[:500]},
+                        ))
+                    model_name = self.swarm._model_spec_for(self.provider_name) if self.swarm else self.provider_name
                     self.cost_tracker.record_tokens(
                         "coordinator",
-                        self.provider_name,
+                        model_name,
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
                         cache_read_tokens=response.usage.cache_read_tokens,
@@ -119,6 +125,12 @@ class CoordinatorAgent:
         return "\n".join(parts) if parts else "No recent activity."
 
     async def stop(self) -> None:
+        if self._hint_queue:
+            try:
+                self.event_bus.unsubscribe(self._hint_queue)
+            except Exception:
+                pass
+            self._hint_queue = None
         if self._hint_task:
             self._hint_task.cancel()
             try:
