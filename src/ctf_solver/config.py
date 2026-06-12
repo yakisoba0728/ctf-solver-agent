@@ -87,3 +87,12 @@ def get_coordinator_provider(settings: Settings) -> str | None:
         return settings.coordinator
     providers = get_active_providers(settings)
     return providers[0][0] if providers else None
+
+
+def load_toml_config(path: str) -> dict:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)

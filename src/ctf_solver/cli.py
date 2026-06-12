@@ -14,7 +14,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from ctf_solver.config import Settings, get_coordinator_provider, validate_provider_config
+from ctf_solver.config import Settings, get_coordinator_provider, load_toml_config, validate_provider_config
 from ctf_solver.events import EventBus
 from ctf_solver.session_state import SessionState
 from ctf_solver.solver.swarm import ChallengeSwarm
@@ -59,6 +59,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--port", default=0, type=int, help="Hint endpoint port (0=auto)")
 @click.option("--verbose", is_flag=True, help="Debug logging")
 @click.option("--resume", default=None, help="Resume from previous session log dir")
+@click.option("--config", default=None, help="TOML config file")
 def main(
     challenge_dir: str | None,
     files: tuple[str, ...],
@@ -86,9 +87,27 @@ def main(
     port: int,
     verbose: bool,
     resume: str | None,
+    config: str | None,
 ) -> None:
     """CTF Solver Agent — multi-model solver swarm."""
     _setup_logging(verbose)
+
+    if config:
+        toml_data = load_toml_config(config)
+        env_overrides: dict[str, str] = {}
+        providers = toml_data.get("providers", {})
+        if "anthropic_api_key" in providers:
+            env_overrides["ANTHROPIC_API_KEY"] = providers["anthropic_api_key"]
+        if "openai_api_key" in providers:
+            env_overrides["OPENAI_API_KEY"] = providers["openai_api_key"]
+        if "zai_api_key" in providers:
+            env_overrides["ZAI_API_KEY"] = providers["zai_api_key"]
+        if "zai_endpoint" in providers:
+            env_overrides["ZAI_ENDPOINT"] = providers["zai_endpoint"]
+        import os
+
+        for k, v in env_overrides.items():
+            os.environ.setdefault(k, v)
 
     if resume:
         try:
