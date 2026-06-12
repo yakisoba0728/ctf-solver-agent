@@ -16,8 +16,9 @@ from ctf_solver.config import Settings, get_active_providers
 from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.prompts import ChallengeMeta, build_prompt, list_distfiles
 from ctf_solver.providers import get_provider
-from ctf_solver.providers.base import SolverSession, ToolCall, ToolResult
+from ctf_solver.providers.base import SolverSession, ToolCall, ToolDef, ToolResult
 from ctf_solver.sandbox.docker import DockerSandbox
+from ctf_solver.session_state import SessionState, SolverState
 from ctf_solver.solver.solver_base import ResultStatus, SolverResult
 from ctf_solver.tools.core import (
     do_bash,
@@ -41,6 +42,85 @@ logger = logging.getLogger(__name__)
 MAX_CONSECUTIVE_ERRORS = 3
 
 SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]
+
+
+def _build_tool_defs() -> list[ToolDef]:
+    return [
+        ToolDef(
+            name="bash",
+            description="Execute a bash command in the Docker sandbox.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "default": 60},
+                },
+                "required": ["command"],
+            },
+        ),
+        ToolDef(
+            name="read_file",
+            description="Read a file from the sandbox.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        ),
+        ToolDef(
+            name="write_file",
+            description="Write content to a file in the sandbox.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+        ),
+        ToolDef(
+            name="list_files",
+            description="List files in a directory in the sandbox.",
+            parameters={"type": "object", "properties": {"path": {"type": "string", "default": "/challenge/distfiles"}}},
+        ),
+        ToolDef(
+            name="submit_flag",
+            description="Submit a flag candidate for validation.",
+            parameters={"type": "object", "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
+        ),
+        ToolDef(
+            name="web_fetch",
+            description="Fetch a URL.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "default": "GET"},
+                    "body": {"type": "string", "default": ""},
+                },
+                "required": ["url"],
+            },
+        ),
+        ToolDef(
+            name="webhook_create",
+            description="Create a webhook.site endpoint.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        ToolDef(
+            name="webhook_get_requests",
+            description="Get requests received by webhook.",
+            parameters={"type": "object", "properties": {"uuid": {"type": "string"}}, "required": ["uuid"]},
+        ),
+        ToolDef(
+            name="view_image",
+            description="View an image file.",
+            parameters={"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]},
+        ),
+        ToolDef(
+            name="notify_coordinator",
+            description="Send a message to the coordinator.",
+            parameters={"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]},
+        ),
+        ToolDef(
+            name="check_findings",
+            description="Check for insights from other solvers.",
+            parameters={"type": "object", "properties": {}},
+        ),
+    ]
 
 
 async def retry_with_backoff(fn, max_retries: int = 3, base_delay: float = 1.0):
@@ -89,6 +169,7 @@ class ChallengeSwarm:
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _submitted_flags: set[str] = field(default_factory=set)
     _circuit_breakers: dict[str, CircuitBreaker] = field(default_factory=dict)
+    session_state: SessionState | None = None
 
     def _check_cooldown(self, inst: SolverInstance) -> tuple[bool, str]:
         """Check if solver is in cooldown. Returns (is_cooled_down, message)."""
@@ -136,6 +217,13 @@ class ChallengeSwarm:
             self.solvers[inst.solver_id] = inst
             self.event_bus.publish(SolverEvent(type="solver_started", solver_id=inst.solver_id, data={"provider": inst.provider_name}))
 
+        self.session_state = SessionState(
+            challenge_name=self.challenge_name,
+            challenge_dir=self.challenge_dir,
+            description=self.description,
+            category=self.category,
+        )
+
         tasks = [asyncio.create_task(self._run_solver(inst), name=f"solver-{inst.solver_id}") for inst in instances]
 
         try:
@@ -147,7 +235,9 @@ class ChallengeSwarm:
                     except Exception:
                         logger.warning("Solver task failed", exc_info=True)
                         continue
+                    self._update_session_state()
                     if result and result.status == ResultStatus.SOLVED:
+                        self._update_session_state()
                         self.cancel_event.set()
                         for p in pending:
                             p.cancel()
@@ -156,6 +246,7 @@ class ChallengeSwarm:
                 tasks = list(pending)
 
             self.cancel_event.set()
+            self._update_session_state()
             return None
         except Exception as e:
             logger.error("Swarm error: %s", e, exc_info=True)
@@ -163,7 +254,10 @@ class ChallengeSwarm:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self._update_session_state()
             return None
+        finally:
+            self._save_session_state()
 
     async def _init_solver(self, inst: SolverInstance, t0: float) -> SolverResult | None:
         try:
@@ -207,7 +301,7 @@ class ChallengeSwarm:
         distfiles = list_distfiles(self.challenge_dir)
         container_arch = "linux/amd64"
         system_prompt = build_prompt(meta, distfiles, container_arch, hint=self.settings.hint)
-        tools: list = []
+        tools = _build_tool_defs()
         inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
         return None
 
@@ -304,7 +398,10 @@ class ChallengeSwarm:
                 result_str = await self._execute_tool(inst, tc)
                 if inst.tracer:
                     inst.tracer.tool_result(tc.name, result_str, inst.step_count)
-                tool_results.append(ToolResult(content=result_str))
+                tr = ToolResult(content=result_str)
+                tr._tool_use_id = getattr(tc, "_tool_use_id", "")  # noqa: B010
+                tr._call_id = getattr(tc, "_call_id", "")  # noqa: B010
+                tool_results.append(tr)
 
                 if "Error" in result_str or "error" in result_str.lower():
                     consecutive_errors += 1
@@ -453,6 +550,29 @@ class ChallengeSwarm:
             return result
         else:
             return f"Unknown tool: {name}"
+
+    def _update_session_state(self) -> None:
+        if not self.session_state:
+            return
+        solver_states = []
+        for sid, inst in self.solvers.items():
+            solver_states.append(SolverState(
+                solver_id=sid,
+                provider=inst.provider_name,
+                status="running" if not self.cancel_event.is_set() else "done",
+                steps=inst.step_count,
+                cost_usd=inst.cost_usd,
+                flag=inst.flag,
+            ))
+        self.session_state.solvers = solver_states
+        self.session_state.total_cost_usd = self.cost_tracker.total_cost_usd
+        self.session_state.confirmed_flag = self.confirmed_flag
+        self.session_state.winner_id = self.winner_id
+
+    def _save_session_state(self) -> None:
+        if self.session_state:
+            log_dir = self.settings.log_dir or "logs"
+            self.session_state.save(log_dir)
 
     def kill(self) -> None:
         self.cancel_event.set()

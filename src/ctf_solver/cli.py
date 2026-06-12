@@ -14,8 +14,14 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from ctf_solver.config import Settings, get_coordinator_provider, validate_provider_config
+from ctf_solver.config import (
+    Settings,
+    get_coordinator_provider,
+    load_toml_config,
+    validate_provider_config,
+)
 from ctf_solver.events import EventBus
+from ctf_solver.session_state import SessionState
 from ctf_solver.solver.swarm import ChallengeSwarm
 
 console = Console()
@@ -57,6 +63,8 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--dry-run", is_flag=True, help="Show config without executing")
 @click.option("--port", default=0, type=int, help="Hint endpoint port (0=auto)")
 @click.option("--verbose", is_flag=True, help="Debug logging")
+@click.option("--resume", default=None, help="Resume from previous session log dir")
+@click.option("--config", default=None, help="TOML config file")
 def main(
     challenge_dir: str | None,
     files: tuple[str, ...],
@@ -83,9 +91,43 @@ def main(
     dry_run: bool,
     port: int,
     verbose: bool,
+    resume: str | None,
+    config: str | None,
 ) -> None:
     """CTF Solver Agent — multi-model solver swarm."""
     _setup_logging(verbose)
+
+    if config:
+        toml_data = load_toml_config(config)
+        env_overrides: dict[str, str] = {}
+        providers = toml_data.get("providers", {})
+        if "anthropic_api_key" in providers:
+            env_overrides["ANTHROPIC_API_KEY"] = providers["anthropic_api_key"]
+        if "openai_api_key" in providers:
+            env_overrides["OPENAI_API_KEY"] = providers["openai_api_key"]
+        if "zai_api_key" in providers:
+            env_overrides["ZAI_API_KEY"] = providers["zai_api_key"]
+        if "zai_endpoint" in providers:
+            env_overrides["ZAI_ENDPOINT"] = providers["zai_endpoint"]
+        import os
+
+        for k, v in env_overrides.items():
+            os.environ.setdefault(k, v)
+
+    if resume:
+        try:
+            prev = SessionState.load(resume)
+        except Exception as e:
+            console.print(f"[red]Error loading session state: {e}[/red]")
+            sys.exit(1)
+        console.print(f"[bold]Previous session: {prev.challenge_name}[/bold]")
+        console.print(f"  Started: {prev.started_at}")
+        for s in prev.solvers:
+            console.print(f"  {s.solver_id}: {s.status}, {s.steps} steps, ${s.cost_usd:.4f}, flag={s.flag}")
+        if prev.confirmed_flag:
+            console.print(f"\n[bold green]FLAG ALREADY FOUND: {prev.confirmed_flag} (by {prev.winner_id})[/bold green]")
+            return
+        console.print("\n[yellow]No flag found previously. Re-launching...[/yellow]")
 
     if not no_tui and not sys.stdout.isatty():
         no_tui = True
@@ -173,6 +215,8 @@ def main(
     def handle_sigint(signum: int, frame: object) -> None:
         console.print("\n[yellow]SIGINT received, shutting down gracefully...[/yellow]")
         swarm_ref[0].kill()
+        swarm_ref[0]._update_session_state()
+        swarm_ref[0]._save_session_state()
         sigint_triggered[0] = True
 
     signal.signal(signal.SIGINT, handle_sigint)
@@ -198,6 +242,7 @@ def main(
 
         async def run_with_tui() -> object:
             from ctf_solver.hint_server import start_hint_server
+            from ctf_solver.writeup import generate_writeup
 
             hint_server, hint_port = await start_hint_server(event_bus, port)
             console.print(f"  Hint endpoint: port {hint_port}")
@@ -207,7 +252,10 @@ def main(
             swarm.kill()
             hint_server.close()
             await hint_server.wait_closed()
-            return await swarm_task
+            result = await swarm_task
+            if result:
+                generate_writeup(output_dir or chall_dir, Path(chall_dir).name, category, result)
+            return result
 
         result = asyncio.run(run_with_tui())
         if result and result.flag:

@@ -9,6 +9,7 @@ from textual.containers import Container, Vertical
 from textual.widgets import Footer, Header, Static
 
 from ctf_solver.events import EventBus, SolverEvent
+from ctf_solver.tui.widgets.coordinator_view import CoordinatorView
 from ctf_solver.tui.widgets.cost_bar import CostBar
 from ctf_solver.tui.widgets.input_bar import HintInputBar
 from ctf_solver.tui.widgets.message_log import MessageLog
@@ -48,6 +49,7 @@ class CTFApp(App):
                 yield Static(f"Challenge: {self.challenge_name}", id="title")
                 yield SolverPanel()
             with Vertical(id="sidebar"):
+                yield CoordinatorView()
                 yield MessageLog()
                 yield CostBar()
                 yield HintInputBar()
@@ -94,6 +96,11 @@ class CTFApp(App):
             if event.type == "flag_found":
                 panel = self.query_one(SolverPanel)
                 panel.update_solver(event.solver_id, last_action=f"FLAG: {event.data}")
+
+            if event.type == "coordinator_guidance":
+                coord_view = self.query_one(CoordinatorView)
+                guidance = event.data.get("guidance", str(event.data))
+                coord_view.add_guidance(guidance)
         except Exception:
             pass
 
@@ -103,7 +110,9 @@ class CTFApp(App):
         msg_log.log_message(f"[operator] hint: {event.text}")
 
     def action_toggle_logs(self) -> None:
-        pass
+        from ctf_solver.tui.screens.logs import LogsScreen
+
+        self.push_screen(LogsScreen(self.event_bus))
 
     def action_toggle_status(self) -> None:
         pass
