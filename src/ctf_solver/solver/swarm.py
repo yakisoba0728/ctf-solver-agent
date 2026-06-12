@@ -14,11 +14,11 @@ from ctf_solver.collaboration.loop_detect import LOOP_WARNING_MESSAGE, LoopDetec
 from ctf_solver.collaboration.message_bus import ChallengeMessageBus
 from ctf_solver.config import Settings, get_active_providers
 from ctf_solver.events import EventBus, SolverEvent
-from ctf_solver.session_state import SessionState, SolverState
 from ctf_solver.prompts import ChallengeMeta, build_prompt, list_distfiles
 from ctf_solver.providers import get_provider
 from ctf_solver.providers.base import SolverSession, ToolCall, ToolDef, ToolResult
 from ctf_solver.sandbox.docker import DockerSandbox
+from ctf_solver.session_state import SessionState, SolverState
 from ctf_solver.solver.solver_base import ResultStatus, SolverResult
 from ctf_solver.tools.core import (
     do_bash,
@@ -399,8 +399,8 @@ class ChallengeSwarm:
                 if inst.tracer:
                     inst.tracer.tool_result(tc.name, result_str, inst.step_count)
                 tr = ToolResult(content=result_str)
-                tr._tool_use_id = getattr(tc, "_tool_use_id", "")
-                tr._call_id = getattr(tc, "_call_id", "")
+                tr._tool_use_id = getattr(tc, "_tool_use_id", "")  # noqa: B010
+                tr._call_id = getattr(tc, "_call_id", "")  # noqa: B010
                 tool_results.append(tr)
 
                 if "Error" in result_str or "error" in result_str.lower():

@@ -5,8 +5,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ctf_solver.solver.solver_base import ResultStatus
-
 
 @dataclass
 class SolverState:
