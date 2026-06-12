@@ -103,7 +103,9 @@ class CTFApp(App):
         msg_log.log_message(f"[operator] hint: {event.text}")
 
     def action_toggle_logs(self) -> None:
-        pass
+        from ctf_solver.tui.screens.logs import LogsScreen
+
+        self.push_screen(LogsScreen(self.event_bus))
 
     def action_toggle_status(self) -> None:
         pass
