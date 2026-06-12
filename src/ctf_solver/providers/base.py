@@ -54,7 +54,7 @@ class SolverSession(ABC):
     async def close(self) -> None: ...
 
 
-class ProviderProtocol(ABC):
+class ProviderBase(ABC):
     name: str
 
     @abstractmethod

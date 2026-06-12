@@ -19,6 +19,7 @@ from ctf_solver.events import EventBus
 from ctf_solver.solver.swarm import ChallengeSwarm
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -85,6 +86,9 @@ def main(
 ) -> None:
     """CTF Solver Agent — multi-model solver swarm."""
     _setup_logging(verbose)
+
+    if not no_tui and not sys.stdout.isatty():
+        no_tui = True
 
     if challenge_dir and files:
         console.print("[red]Error: --challenge-dir and --files are mutually exclusive[/red]")
@@ -164,21 +168,25 @@ def main(
     )
 
     swarm_ref = [swarm]
+    sigint_triggered = [False]
 
     def handle_sigint(signum: int, frame: object) -> None:
         console.print("\n[yellow]SIGINT received, shutting down gracefully...[/yellow]")
         swarm_ref[0].kill()
+        sigint_triggered[0] = True
 
     signal.signal(signal.SIGINT, handle_sigint)
 
     if no_tui:
-        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port))
+        result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port, sigint_triggered))
         from ctf_solver.writeup import generate_writeup
 
         if result and result.flag:
             console.print(f"\n[bold green]FLAG FOUND: {result.flag}[/bold green]")
             console.print(f"  Solver: {result.solver_id}")
             console.print(f"  Steps: {result.steps}, Duration: {result.duration:.1f}s, Cost: ${result.cost_usd:.4f}")
+        elif sigint_triggered[0]:
+            console.print("\n[yellow]Interrupted — generating partial writeup.[/yellow]")
         else:
             console.print("\n[red]No flag found.[/red]")
         if result:
@@ -192,7 +200,8 @@ def main(
             from ctf_solver.hint_server import start_hint_server
 
             hint_server, hint_port = await start_hint_server(event_bus, port)
-            console.print(f"  Hint server: http://127.0.0.1:{hint_port}/hint")
+            console.print(f"  Hint endpoint: port {hint_port}")
+            console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
             swarm_task = asyncio.create_task(swarm.run())
             await app.run_async()
             swarm.kill()
@@ -205,12 +214,34 @@ def main(
             console.print(f"\n[bold green]FLAG: {result.flag}[/bold green]")
 
 
-async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Settings, interactive: bool, port: int) -> object:
+async def _run_cli(
+    swarm: ChallengeSwarm,
+    event_bus: EventBus,
+    settings: Settings,
+    interactive: bool,
+    port: int,
+    sigint_triggered: list[bool],
+) -> object:
     from ctf_solver.events import SolverEvent
     from ctf_solver.hint_server import start_hint_server
 
     hint_server, hint_port = await start_hint_server(event_bus, port)
-    console.print(f"  Hint server: http://127.0.0.1:{hint_port}/hint")
+    console.print(f"  Hint endpoint: port {hint_port}")
+    console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
+
+    coordinator = None
+    coord_provider = get_coordinator_provider(settings)
+    if coord_provider:
+        from ctf_solver.solver.coordinator import CoordinatorAgent
+
+        coordinator = CoordinatorAgent(
+            provider_name=coord_provider,
+            settings=settings,
+            event_bus=event_bus,
+            cost_tracker=swarm.cost_tracker,
+            message_bus=swarm.message_bus,
+            swarm=swarm,
+        )
 
     queue = event_bus.subscribe()
 
@@ -248,7 +279,32 @@ async def _run_cli(swarm: ChallengeSwarm, event_bus: EventBus, settings: Setting
 
         stdin_task = asyncio.create_task(read_stdin())
 
+    if coordinator:
+        await coordinator.start()
+
     result = await swarm.run()
+
+    if coordinator:
+        await coordinator.stop()
+
+    if sigint_triggered[0] and result is None:
+        best: object = None
+        for sid, inst in swarm.solvers.items():
+            if inst.flag:
+                from ctf_solver.solver.solver_base import ResultStatus, SolverResult
+
+                best = SolverResult(
+                    solver_id=sid,
+                    status=ResultStatus.CANCELLED,
+                    flag=inst.flag,
+                    steps=inst.step_count,
+                    duration=0.0,
+                    cost_usd=inst.cost_usd,
+                    findings_summary=inst.findings,
+                )
+                break
+        result = best
+
     events_task.cancel()
     if stdin_task:
         stdin_task.cancel()

@@ -5,12 +5,17 @@ from __future__ import annotations
 import ipaddress
 import json
 import shlex
-from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
+from ctf_solver.collaboration.message_bus import ChallengeMessageBus
+from ctf_solver.events import EventBus, SolverEvent
+from ctf_solver.sandbox import SandboxProtocol
+
 MAX_OUTPUT = 24_000
+WEB_FETCH_MAX = 20_000
+WEBHOOK_MAX = 8000
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT) -> str:
@@ -21,7 +26,7 @@ def _truncate(text: str, limit: int = MAX_OUTPUT) -> str:
     return head[:limit] + f"\n... [truncated — {len(text)} total chars, {len(lines)} lines]"
 
 
-async def do_bash(sandbox, command: str, timeout_seconds: int = 60) -> str:
+async def do_bash(sandbox: SandboxProtocol, command: str, timeout_seconds: int = 60) -> str:
     result = await sandbox.exec(command, timeout_s=timeout_seconds)
     parts: list[str] = []
     if result.stdout:
@@ -34,7 +39,7 @@ async def do_bash(sandbox, command: str, timeout_seconds: int = 60) -> str:
     return _truncate(out)
 
 
-async def do_read_file(sandbox, path: str) -> str:
+async def do_read_file(sandbox: SandboxProtocol, path: str) -> str:
     try:
         data = await sandbox.read_file(path)
     except Exception as e:
@@ -47,7 +52,7 @@ async def do_read_file(sandbox, path: str) -> str:
     return _truncate(data) if isinstance(data, str) else str(data)
 
 
-async def do_write_file(sandbox, path: str, content: str) -> str:
+async def do_write_file(sandbox: SandboxProtocol, path: str, content: str) -> str:
     try:
         await sandbox.write_file(path, content)
         return f"Written {len(content)} bytes to {path}"
@@ -55,7 +60,7 @@ async def do_write_file(sandbox, path: str, content: str) -> str:
         return f"Error writing file: {e}"
 
 
-async def do_list_files(sandbox, path: str = "/challenge/distfiles") -> str:
+async def do_list_files(sandbox: SandboxProtocol, path: str = "/challenge/distfiles") -> str:
     result = await sandbox.exec(f"ls -la {shlex.quote(path)}")
     if result.exit_code != 0:
         return result.stderr.strip() or f"Error listing {path}"
@@ -76,8 +81,8 @@ async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
             resp = await client.request(method, url, content=body or None, headers={"User-Agent": "Mozilla/5.0"})
             text = resp.text
             prefix = f"HTTP {resp.status_code} {resp.reason_phrase}\n{'─' * 40}\n"
-            if len(text) > 20_000:
-                text = text[:20_000] + f"\n... [truncated, total {len(resp.text)} bytes]"
+            if len(text) > WEB_FETCH_MAX:
+                text = text[:WEB_FETCH_MAX] + f"\n... [truncated, total {len(resp.text)} bytes]"
             return prefix + text
     except Exception as e:
         return f"Fetch error: {e}"
@@ -105,7 +110,7 @@ async def do_webhook_get_requests(uuid: str) -> str:
             if not data.get("data"):
                 return "No requests received yet."
             out = json.dumps(data["data"], indent=2)
-            return out[:8000] if len(out) > 8000 else out
+            return out[:WEBHOOK_MAX] if len(out) > WEBHOOK_MAX else out
     except Exception as e:
         return f"webhook_get_requests error: {e}"
 
@@ -130,16 +135,15 @@ async def do_submit_flag(
     return f"Flag candidate accepted: {flag}", True
 
 
-async def do_notify_coordinator(message: str, event_bus: Any = None, solver_id: str = "") -> str:
+async def do_notify_coordinator(message: str, event_bus: EventBus | None = None, solver_id: str = "") -> str:
     """Send a message to the coordinator via the event bus."""
     if not event_bus:
         return "No event bus available."
-    from ctf_solver.events import SolverEvent
     event_bus.publish(SolverEvent(type="coordinator_guidance", solver_id=solver_id, data={"message": message}))
     return "Message sent to coordinator."
 
 
-async def do_check_findings(message_bus, model_spec: str) -> str:
+async def do_check_findings(message_bus: ChallengeMessageBus | None, model_spec: str) -> str:
     """Get unread findings from sibling solvers."""
     if not message_bus:
         return "No message bus available."

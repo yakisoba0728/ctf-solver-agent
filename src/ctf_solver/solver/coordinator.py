@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+COORDINATION_INTERVAL = 30
+
+
 @dataclass
 class CoordinatorAgent:
     provider_name: str
@@ -54,7 +57,7 @@ class CoordinatorAgent:
 
     async def _coordination_loop(self) -> None:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(COORDINATION_INTERVAL)
             if not self.swarm or not self.session:
                 continue
             status = self.swarm.get_status()
