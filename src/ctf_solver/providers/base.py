@@ -53,6 +53,9 @@ class SolverSession(ABC):
     @abstractmethod
     async def inject_context(self, text: str) -> None: ...
 
+    async def inject_image(self, data: bytes, mime_type: str) -> None:  # noqa: B027
+        pass
+
     @abstractmethod
     async def close(self) -> None: ...
 

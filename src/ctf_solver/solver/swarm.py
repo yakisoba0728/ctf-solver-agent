@@ -564,7 +564,10 @@ class ChallengeSwarm:
 
             result = await do_view_image(inst.sandbox, args.get("filename", ""), use_vision=True)
             if isinstance(result, tuple):
-                return f"Image received ({result[1]}), {len(result[0])} bytes"
+                image_data, mime_type = result
+                if inst.session:
+                    await inst.session.inject_image(image_data, mime_type)
+                return f"Image loaded ({mime_type}, {len(image_data)} bytes). Analyze the image above."
             return result
         else:
             return f"Unknown tool: {name}"

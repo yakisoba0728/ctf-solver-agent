@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Any
 
@@ -36,6 +37,7 @@ class ClaudeSession(SolverSession):
         self._messages: list[dict] = []
         self._system_prompt = system_prompt
         self._pending_context: str | None = None
+        self._pending_images: list[dict] = []
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -55,7 +57,13 @@ class ClaudeSession(SolverSession):
                 })
             self._messages.append({"role": "user", "content": content_blocks})
         elif message:
-            self._messages.append({"role": "user", "content": message})
+            if self._pending_images:
+                content_parts: list[dict] = [{"type": "text", "text": message}]
+                content_parts.extend(self._pending_images)
+                self._pending_images = []
+                self._messages.append({"role": "user", "content": content_parts})
+            else:
+                self._messages.append({"role": "user", "content": message})
 
         if self._pending_context:
             last_user_idx = None
@@ -124,6 +132,16 @@ class ClaudeSession(SolverSession):
 
     async def inject_context(self, text: str) -> None:
         self._pending_context = text
+
+    async def inject_image(self, data: bytes, mime_type: str) -> None:
+        self._pending_images.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        })
 
     async def close(self) -> None:
         if self._client:
