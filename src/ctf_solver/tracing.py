@@ -22,7 +22,7 @@ class SolverTracer:
     def _write(self, data: dict) -> None:
         data["ts"] = time.time()
         data["challenge"] = self.challenge_name
-        self._file.write(json.dumps(data) + "\n")
+        self._file.write(json.dumps(data, default=str) + "\n")
         self._file.flush()
 
     def event(self, event_type: str, **kwargs) -> None:

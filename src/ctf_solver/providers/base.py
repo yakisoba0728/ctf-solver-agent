@@ -17,12 +17,15 @@ class ToolDef:
 class ToolCall:
     name: str
     arguments: dict
+    call_id: str = ""
 
 
 @dataclass
 class ToolResult:
     content: str | tuple[bytes, str]
     error: str | None = None
+    tool_use_id: str = ""
+    call_id: str = ""
 
 
 @dataclass

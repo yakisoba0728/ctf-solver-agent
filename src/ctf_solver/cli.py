@@ -109,6 +109,15 @@ def main(
             env_overrides["ZAI_API_KEY"] = providers["zai_api_key"]
         if "zai_endpoint" in providers:
             env_overrides["ZAI_ENDPOINT"] = providers["zai_endpoint"]
+        models = toml_data.get("models", {})
+        if "claude_model" in models:
+            env_overrides["CLAUDE_MODEL"] = models["claude_model"]
+        if "codex_model" in models:
+            env_overrides["CODEX_MODEL"] = models["codex_model"]
+        if "zai_model" in models:
+            env_overrides["ZAI_MODEL"] = models["zai_model"]
+        if "zai_endpoint" in models:
+            env_overrides["ZAI_ENDPOINT"] = models["zai_endpoint"]
         import os
 
         for k, v in env_overrides.items():
@@ -174,7 +183,10 @@ def main(
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
-    coord = get_coordinator_provider(settings)
+    try:
+        coord = get_coordinator_provider(settings)
+    except ValueError:
+        coord = None
 
     console.print("[bold]CTF Solver Agent[/bold]")
     console.print(f"  Providers: claude={claude_count}, codex={codex_count}, zai={zai_count}")
@@ -195,9 +207,25 @@ def main(
         chall_dir = challenge_dir
     else:
         chall_dir = tempfile.mkdtemp(prefix="ctf-chall-")
+        distfiles_dir = Path(chall_dir) / "distfiles"
+        distfiles_dir.mkdir(parents=True, exist_ok=True)
         for f in files:
-            shutil.copy2(f, chall_dir)
+            shutil.copy2(f, str(distfiles_dir))
         (Path(chall_dir) / "description.txt").write_text(desc or "")
+
+    if not desc and challenge_dir:
+        desc_path = Path(chall_dir)
+        for candidate in ["description.txt", "challenge.yml", "challenge.yaml"]:
+            if (desc_path / candidate).exists():
+                if candidate.endswith(".yml") or candidate.endswith(".yaml"):
+                    from ctf_solver.prompts import ChallengeMeta
+                    meta = ChallengeMeta.from_yaml(str(desc_path / candidate))
+                    desc = meta.description
+                    if not category:
+                        category = meta.category
+                else:
+                    desc = (desc_path / candidate).read_text().strip()
+                break
 
     event_bus = EventBus()
     swarm = ChallengeSwarm(
@@ -215,8 +243,6 @@ def main(
     def handle_sigint(signum: int, frame: object) -> None:
         console.print("\n[yellow]SIGINT received, shutting down gracefully...[/yellow]")
         swarm_ref[0].kill()
-        swarm_ref[0]._update_session_state()
-        swarm_ref[0]._save_session_state()
         sigint_triggered[0] = True
 
     signal.signal(signal.SIGINT, handle_sigint)
@@ -247,9 +273,26 @@ def main(
             hint_server, hint_port = await start_hint_server(event_bus, port)
             console.print(f"  Hint endpoint: port {hint_port}")
             console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
+
+            coordinator = None
+            coord_provider = coord
+            if coord_provider:
+                from ctf_solver.solver.coordinator import CoordinatorAgent
+                coordinator = CoordinatorAgent(
+                    provider_name=coord_provider,
+                    settings=settings,
+                    event_bus=event_bus,
+                    cost_tracker=swarm.cost_tracker,
+                    message_bus=swarm.message_bus,
+                    swarm=swarm,
+                )
+                await coordinator.start()
+
             swarm_task = asyncio.create_task(swarm.run())
             await app.run_async()
             swarm.kill()
+            if coordinator:
+                await coordinator.stop()
             hint_server.close()
             await hint_server.wait_closed()
             result = await swarm_task
@@ -353,11 +396,14 @@ async def _run_cli(
                 break
         result = best
 
-    events_task.cancel()
-    if stdin_task:
-        stdin_task.cancel()
-    hint_server.close()
-    await hint_server.wait_closed()
+    try:
+        events_task.cancel()
+        if stdin_task:
+            stdin_task.cancel()
+        hint_server.close()
+        await hint_server.wait_closed()
+    except Exception:
+        pass
     return result
 
 

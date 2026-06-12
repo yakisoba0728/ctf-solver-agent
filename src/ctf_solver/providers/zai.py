@@ -29,19 +29,29 @@ class ZAISession(SolverSession):
     def __init__(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> None:
         self._solver_id = solver_id
         self._api_key = config.get("zai_api_key", "")
-        self._endpoint = config.get("zai_endpoint", "https://api.z.ai/v1").rstrip("/")
-        self._model = config.get("zai_model", "z-ai-default")
+        self._endpoint = config.get("zai_endpoint", "https://api.z.ai/api/paas/v4/").rstrip("/")
+        self._model = config.get("zai_model", "glm-5.1")
         self._tools = _tools_to_openai(tools)
         self._messages: list[dict] = []
         if system_prompt:
             self._messages.append({"role": "system", "content": system_prompt})
         self._pending_context: str | None = None
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=300.0)
+        return self._client
 
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
         if tool_results:
             for tr in tool_results:
                 content = tr.content if isinstance(tr.content, str) else str(tr.content)
-                self._messages.append({"role": "tool", "content": content})
+                self._messages.append({
+                    "role": "tool",
+                    "tool_call_id": tr.call_id,
+                    "content": content,
+                })
         elif message:
             self._messages.append({"role": "user", "content": message})
 
@@ -63,14 +73,14 @@ class ZAISession(SolverSession):
         if self._tools:
             body["tools"] = self._tools
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                f"{self._endpoint}/chat/completions",
-                headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = self._get_client()
+        resp = await client.post(
+            f"{self._endpoint}/chat/completions",
+            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         choice = data["choices"][0]
         msg = choice["message"]
@@ -84,7 +94,11 @@ class ZAISession(SolverSession):
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {"raw": args}
-            tool_calls.append(ToolCall(name=fn.get("name", ""), arguments=args))
+            tool_calls.append(ToolCall(
+                name=fn.get("name", ""),
+                arguments=args,
+                call_id=tc.get("id", ""),
+            ))
 
         usage_data = data.get("usage", {})
         usage = TokenUsage(
@@ -102,7 +116,9 @@ class ZAISession(SolverSession):
         self._pending_context = text
 
     async def close(self) -> None:
-        pass
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
 
 class ZAIProvider(ProviderBase):

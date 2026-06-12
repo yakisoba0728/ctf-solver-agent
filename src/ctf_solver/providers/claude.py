@@ -36,21 +36,24 @@ class ClaudeSession(SolverSession):
         self._messages: list[dict] = []
         self._system_prompt = system_prompt
         self._pending_context: str | None = None
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=300.0)
+        return self._client
 
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
         if tool_results:
+            content_blocks = []
             for tr in tool_results:
                 content = tr.content if isinstance(tr.content, str) else str(tr.content)
-                self._messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": getattr(tr, "_tool_use_id", ""),
-                            "content": content,
-                        }
-                    ],
+                content_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tr.tool_use_id or tr.call_id,
+                    "content": content,
                 })
+            self._messages.append({"role": "user", "content": content_blocks})
         elif message:
             self._messages.append({"role": "user", "content": message})
 
@@ -75,18 +78,18 @@ class ClaudeSession(SolverSession):
         if self._tools:
             body["tools"] = self._tools
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self._api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = self._get_client()
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self._api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -94,9 +97,11 @@ class ClaudeSession(SolverSession):
             if block.get("type") == "text":
                 text_parts.append(block["text"])
             elif block.get("type") == "tool_use":
-                tc = ToolCall(name=block["name"], arguments=block.get("input", {}))
-                tc._tool_use_id = block["id"]  # noqa: B010
-                tool_calls.append(tc)
+                tool_calls.append(ToolCall(
+                    name=block["name"],
+                    arguments=block.get("input", {}),
+                    call_id=block["id"],
+                ))
 
         usage_data = data.get("usage", {})
         usage = TokenUsage(
@@ -121,7 +126,9 @@ class ClaudeSession(SolverSession):
         self._pending_context = text
 
     async def close(self) -> None:
-        pass
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
 
 class ClaudeProvider(ProviderBase):

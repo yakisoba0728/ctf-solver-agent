@@ -18,6 +18,7 @@ from ctf_solver.prompts import ChallengeMeta, build_prompt, list_distfiles
 from ctf_solver.providers import get_provider
 from ctf_solver.providers.base import SolverSession, ToolCall, ToolDef, ToolResult
 from ctf_solver.sandbox.docker import DockerSandbox
+from ctf_solver.sandbox.host import HostSandbox
 from ctf_solver.session_state import SessionState, SolverState
 from ctf_solver.solver.solver_base import ResultStatus, SolverResult
 from ctf_solver.tools.core import (
@@ -139,11 +140,12 @@ class SolverInstance:
     solver_id: str
     provider_name: str
     model_spec: str
-    sandbox: DockerSandbox
+    sandbox: DockerSandbox | HostSandbox
     session: SolverSession | None = None
     tracer: SolverTracer | None = None
     loop_detector: LoopDetector = field(default_factory=LoopDetector)
     step_count: int = 0
+    consecutive_errors: int = 0
     flag: str | None = None
     confirmed: bool = False
     findings: str = ""
@@ -195,12 +197,15 @@ class ChallengeSwarm:
         for provider_name, count in get_active_providers(self.settings):
             for i in range(count):
                 solver_id = f"{provider_name}-{i}"
-                sandbox = DockerSandbox(
-                    image=self.settings.sandbox_image,
-                    challenge_dir=self.challenge_dir,
-                    memory_limit=self.settings.sandbox_memory,
-                    cpu_limit=self.settings.sandbox_cpus,
-                )
+                if self.settings.no_docker:
+                    sandbox: DockerSandbox | HostSandbox = HostSandbox(challenge_dir=self.challenge_dir)
+                else:
+                    sandbox = DockerSandbox(
+                        image=self.settings.sandbox_image,
+                        challenge_dir=self.challenge_dir,
+                        memory_limit=self.settings.sandbox_memory,
+                        cpu_limit=self.settings.sandbox_cpus,
+                    )
                 instance = SolverInstance(
                     solver_id=solver_id,
                     provider_name=provider_name,
@@ -260,19 +265,20 @@ class ChallengeSwarm:
             self._save_session_state()
 
     async def _init_solver(self, inst: SolverInstance, t0: float) -> SolverResult | None:
-        try:
-            docker = aiodocker.Docker()
-            await docker.version()
-            await docker.close()
-        except Exception:
-            return SolverResult(
-                solver_id=inst.solver_id,
-                status=ResultStatus.ERROR,
-                flag=None,
-                steps=0,
-                duration=time.monotonic() - t0,
-                error="Docker is not running. Start Docker and try again.",
-            )
+        if not self.settings.no_docker:
+            try:
+                docker = aiodocker.Docker()
+                await docker.version()
+                await docker.close()
+            except Exception:
+                return SolverResult(
+                    solver_id=inst.solver_id,
+                    status=ResultStatus.ERROR,
+                    flag=None,
+                    steps=0,
+                    duration=time.monotonic() - t0,
+                    error="Docker is not running. Start Docker and try again.",
+                )
 
         await inst.sandbox.start()
         self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
@@ -306,7 +312,7 @@ class ChallengeSwarm:
         return None
 
     async def _run_loop(self, inst: SolverInstance, t0: float) -> SolverResult:
-        message = ""
+        message = "Start solving."
         pending_tool_results: list[ToolResult] | None = None
 
         while not self.cancel_event.is_set():
@@ -338,11 +344,17 @@ class ChallengeSwarm:
                     inst.loop_detector.reset()
 
             try:
+                remaining = self.settings.timeout - (time.monotonic() - t0)
+                if remaining <= 0:
+                    break
                 _msg, _presults = message, pending_tool_results
-                response = await retry_with_backoff(
-                    lambda m=_msg, p=_presults: inst.session.send(m, tool_results=p),
-                    max_retries=3,
-                    base_delay=1.0,
+                response = await asyncio.wait_for(
+                    retry_with_backoff(
+                        lambda m=_msg, p=_presults: inst.session.send(m, tool_results=p),
+                        max_retries=3,
+                        base_delay=1.0,
+                    ),
+                    timeout=max(remaining, 1.0),
                 )
             except Exception as e:
                 if cb:
@@ -390,7 +402,6 @@ class ChallengeSwarm:
                 break
 
             tool_results: list[ToolResult] = []
-            consecutive_errors = 0
             for tc in response.tool_calls:
                 inst.step_count += 1
                 if inst.tracer:
@@ -398,14 +409,12 @@ class ChallengeSwarm:
                 result_str = await self._execute_tool(inst, tc)
                 if inst.tracer:
                     inst.tracer.tool_result(tc.name, result_str, inst.step_count)
-                tr = ToolResult(content=result_str)
-                tr._tool_use_id = getattr(tc, "_tool_use_id", "")  # noqa: B010
-                tr._call_id = getattr(tc, "_call_id", "")  # noqa: B010
+                tr = ToolResult(content=result_str, tool_use_id=tc.call_id, call_id=tc.call_id)
                 tool_results.append(tr)
 
                 if "Error" in result_str or "error" in result_str.lower():
-                    consecutive_errors += 1
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    inst.consecutive_errors += 1
+                    if inst.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                         logger.warning(
                             "[%s] %d consecutive tool errors, stopping",
                             inst.solver_id,
@@ -413,7 +422,7 @@ class ChallengeSwarm:
                         )
                         break
                 else:
-                    consecutive_errors = 0
+                    inst.consecutive_errors = 0
 
                 loop_status = inst.loop_detector.check(tc.name, tc.arguments)
                 if loop_status == "warn":
@@ -498,17 +507,26 @@ class ChallengeSwarm:
                 error=str(e),
             )
         finally:
+            if inst.session:
+                await inst.session.close()
             await inst.sandbox.stop()
             if inst.tracer:
                 inst.tracer.close()
             self.event_bus.publish(SolverEvent(type="solver_done", solver_id=inst.solver_id, data={}))
 
     async def _execute_tool(self, inst: SolverInstance, tc: ToolCall) -> str:
+        try:
+            return await self._execute_tool_inner(inst, tc)
+        except Exception as e:
+            logger.warning("[%s] Tool %s raised: %s", inst.solver_id, tc.name, e)
+            return f"Tool error: {e}"
+
+    async def _execute_tool_inner(self, inst: SolverInstance, tc: ToolCall) -> str:
         name = tc.name
         args = tc.arguments
 
         if name == "bash":
-            return await do_bash(inst.sandbox, args.get("command", ""), int(args.get("timeout", 60)))
+            return await do_bash(inst.sandbox, args.get("command", ""), int(args.get("timeout_seconds", args.get("timeout", 60))))
         elif name == "read_file":
             return await do_read_file(inst.sandbox, args.get("path", ""))
         elif name == "write_file":

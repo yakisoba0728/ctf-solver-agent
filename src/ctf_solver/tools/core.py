@@ -77,6 +77,15 @@ async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
     except ValueError:
         pass
     try:
+        import socket
+        resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for _family, _, _, _, sockaddr in resolved:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return "Fetch error: hostname resolves to private/local IP address."
+    except (socket.gaierror, ValueError):
+        pass
+    try:
         async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
             resp = await client.request(method, url, content=body or None, headers={"User-Agent": "Mozilla/5.0"})
             text = resp.text
@@ -132,14 +141,14 @@ async def do_submit_flag(
     if not matches:
         return f"Flag '{flag}' does not match expected pattern.", False
     submitted_flags.add(flag)
-    return f"Flag candidate accepted: {flag}", True
+    return f"Flag candidate matches pattern: {flag}", True
 
 
 async def do_notify_coordinator(message: str, event_bus: EventBus | None = None, solver_id: str = "") -> str:
     """Send a message to the coordinator via the event bus."""
     if not event_bus:
         return "No event bus available."
-    event_bus.publish(SolverEvent(type="coordinator_guidance", solver_id=solver_id, data={"message": message}))
+    event_bus.publish(SolverEvent(type="user_hint", solver_id=solver_id, data={"message": message}))
     return "Message sent to coordinator."
 
 

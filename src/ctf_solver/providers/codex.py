@@ -232,7 +232,7 @@ class CodexSession(SolverSession):
         if tool_results:
             for tr in tool_results:
                 content = tr.content if isinstance(tr.content, str) else str(tr.content)
-                call_id = getattr(tr, "_call_id", "unknown")
+                call_id = tr.call_id
                 await self._rpc(
                     "item/tool/call/response",
                     {
@@ -265,9 +265,7 @@ class CodexSession(SolverSession):
                 tc = params.get("tool", {})
                 name = tc.get("name", "")
                 args = tc.get("arguments", {})
-                tc_obj = ToolCall(name=name, arguments=args)
-                tc_obj._call_id = call_id  # noqa: B010
-                tool_calls.append(tc_obj)
+                tool_calls.append(ToolCall(name=name, arguments=args, call_id=call_id))
             except TimeoutError:
                 continue
 

@@ -10,7 +10,10 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     zai_api_key: str = ""
-    zai_endpoint: str = "https://api.z.ai/v1"
+    zai_endpoint: str = "https://api.z.ai/api/paas/v4/"
+    claude_model: str = "claude-opus-4-6-20250612"
+    codex_model: str = "gpt-5.4"
+    zai_model: str = "glm-5.1"
 
     # Provider counts (set via CLI, not env)
     claude_count: int = 0
@@ -53,6 +56,9 @@ class Settings(BaseSettings):
             "openai_api_key": self.openai_api_key,
             "zai_api_key": self.zai_api_key,
             "zai_endpoint": self.zai_endpoint,
+            "claude_model": self.claude_model,
+            "codex_model": self.codex_model,
+            "zai_model": self.zai_model,
         }
 
 

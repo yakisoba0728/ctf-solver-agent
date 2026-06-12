@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
+
+MAX_EVENT_QUEUE = 1000
 
 
 @dataclass
@@ -35,13 +40,22 @@ class EventBus:
     _subscribers: list[asyncio.Queue[SolverEvent]] = field(default_factory=list)
 
     def subscribe(self) -> asyncio.Queue[SolverEvent]:
-        q: asyncio.Queue[SolverEvent] = asyncio.Queue()
+        q: asyncio.Queue[SolverEvent] = asyncio.Queue(maxsize=MAX_EVENT_QUEUE)
         self._subscribers.append(q)
         return q
 
+    def unsubscribe(self, q: asyncio.Queue[SolverEvent]) -> None:
+        try:
+            self._subscribers.remove(q)
+        except ValueError:
+            pass
+
     def publish(self, event: SolverEvent) -> None:
         for q in self._subscribers:
-            q.put_nowait(event)
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("Event queue full, dropping event: %s", event.type)
 
     async def publish_and_wait(self, event: SolverEvent) -> None:
         self.publish(event)
