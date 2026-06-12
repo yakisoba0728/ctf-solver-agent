@@ -119,25 +119,31 @@ class DockerSandbox:
         exec_instance = await self._container.exec(
             cmd=["bash", "-c", wrapped], stdout=True, stderr=True, tty=False,
         )
-        stream = await exec_instance.start(detach=False)
+        stream = exec_instance.start(detach=False)
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
 
         async def _collect() -> None:
-            async for msg_type, data in stream:
-                if isinstance(data, str):
-                    data = data.encode("utf-8")
-                if msg_type == 1:
-                    stdout_chunks.append(data)
-                else:
-                    stderr_chunks.append(data)
+            async with stream:
+                while True:
+                    msg = await stream.read_out()
+                    if msg is None:
+                        break
+                    data = msg.data
+                    if isinstance(data, str):
+                        data = data.encode("utf-8")
+                    stream_type = getattr(msg, "extra", 1)
+                    if stream_type == 1:
+                        stdout_chunks.append(data)
+                    else:
+                        stderr_chunks.append(data)
 
         try:
             await asyncio.wait_for(_collect(), timeout=timeout_s + 30)
         except TimeoutError:
             return ExecResult(exit_code=-1, stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"), stderr="Command timed out")
-        inspect = await exec_instance.inspect()
-        exit_code = inspect.get("ExitCode", 0)
+        exec_info = await exec_instance.inspect()
+        exit_code = exec_info.get("ExitCode", 0)
         return ExecResult(
             exit_code=exit_code,
             stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
@@ -148,17 +154,19 @@ class DockerSandbox:
         if not self._container:
             msg = "Sandbox not started"
             raise RuntimeError(msg)
-        data_bytes, stat = await asyncio.wait_for(self._container.get_archive(path), timeout=30)
-        with tarfile.open(fileobj=io.BytesIO(data_bytes)) as tar:
-            for member in tar:
-                if member.isfile():
-                    f = tar.extractfile(member)
-                    if f:
-                        file_data = f.read()
-                        try:
-                            return file_data.decode("utf-8")
-                        except UnicodeDecodeError:
-                            return file_data
+        try:
+            tar = await asyncio.wait_for(self._container.get_archive(path), timeout=30)
+        except aiodocker.exceptions.DockerError as e:
+            raise FileNotFoundError(str(e)) from e
+        for member in tar:
+            if member.isfile():
+                f = tar.extractfile(member)
+                if f:
+                    file_data = f.read()
+                    try:
+                        return file_data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return file_data
         msg = f"No file found at {path}"
         raise FileNotFoundError(msg)
 
